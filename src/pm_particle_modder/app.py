@@ -34,6 +34,9 @@ def main() -> int:
     context.setContextProperty("opacityModel", controller.opacity_model)
     context.setContextProperty("intensityModel", controller.intensity_model)
     context.setContextProperty("visualizerModel", controller.visualizer_model)
+    context.setContextProperty("archiveParticlesModel", controller.archive_particles_model)
+    context.setContextProperty("foundArchivesModel", controller.found_archives_model)
+    context.setContextProperty("assetLinksModel", controller.asset_links_model)
 
     qml_path = package_dir / "ui" / "qml" / "Main.qml"
     engine.load(QUrl.fromLocalFile(str(qml_path)))
@@ -44,4 +47,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

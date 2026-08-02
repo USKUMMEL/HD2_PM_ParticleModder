@@ -114,10 +114,13 @@ ApplicationWindow {
 
             Rectangle { Layout.preferredWidth: 1; Layout.fillHeight: true; Layout.topMargin: 11; Layout.bottomMargin: 11; color: Theme.border }
             PmButton { text: "Open"; accent: true; tooltip: "Open particle files"; onClicked: controller.openFiles() }
+            PmButton { text: "Game Data"; tooltip: "Select the Helldivers 2 data folder"; onClicked: controller.selectGameDataDirectory() }
+            PmButton { text: "Load Archive"; tooltip: "Load an archive by ID or found archive name"; onClicked: window.sectionIndex = 5 }
             PmButton { text: "Save"; enabled: controller.hasDocument; tooltip: "Save current file"; onClicked: controller.saveCurrent() }
             PmButton { text: "Save As"; enabled: controller.hasDocument; tooltip: "Save current file as"; onClicked: controller.saveCurrentAs() }
             PmButton { text: "Save All"; enabled: controller.hasDocument; tooltip: "Save all modified files"; onClicked: controller.saveAll() }
             PmButton { text: "Project"; enabled: controller.documentCount > 0; tooltip: "Save PM project"; onClicked: controller.saveProject() }
+            PmButton { text: "Write Patch"; enabled: controller.stagedChangeCount > 0; tooltip: "Write staged archive changes"; onClicked: controller.writePatch() }
             Item { Layout.fillWidth: true }
             PmButton { text: "Undo"; enabled: controller.canUndo; tooltip: "Undo last edit"; onClicked: controller.undo() }
             PmButton { text: "Redo"; enabled: controller.canRedo; tooltip: "Redo last edit"; onClicked: controller.redo() }
@@ -336,7 +339,7 @@ ApplicationWindow {
                         font.weight: Font.DemiBold
                     }
                     Repeater {
-                        model: ["Color", "Opacity", "Intensity", "Lifetime", "Visualizers"]
+                        model: ["Color", "Opacity", "Intensity", "Lifetime", "Visualizers", "Archive"]
                         delegate: Rectangle {
                             id: navItem
                             required property int index
@@ -516,7 +519,8 @@ ApplicationWindow {
                         objectName: "editorStack"
                         Layout.fillWidth: true
                         Layout.fillHeight: true
-                        currentIndex: controller.hasDocument ? window.sectionIndex : 5
+                        currentIndex: controller.hasDocument || window.sectionIndex === 5
+                                      ? window.sectionIndex : 6
 
                         GraphTable {
                             objectName: "colorGraphTable"
@@ -635,6 +639,139 @@ ApplicationWindow {
                                     text: "No editable visualizers in this particle file"
                                     color: Theme.textMuted
                                     font.pixelSize: 14
+                                }
+                            }
+                        }
+
+                        Item {
+                            id: assetPanel
+                            property int selectedAssetIndex: -1
+                            property bool selectedTexture: false
+                            Component.onCompleted: controller.searchFoundArchives("")
+                            ColumnLayout {
+                                anchors.fill: parent
+                                anchors.margins: 16
+                                spacing: 12
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    Text {
+                                        text: controller.hasArchive ? "LOAD ARCHIVE  " + controller.archiveName : "LOAD ARCHIVE"
+                                        color: Theme.text
+                                        font.pixelSize: 15
+                                        font.weight: Font.DemiBold
+                                        elide: Text.ElideMiddle
+                                        Layout.fillWidth: true
+                                    }
+                                    Text {
+                                        text: controller.stagedChangeCount > 0 ? controller.stagedChangeCount + " STAGED" : ""
+                                        color: Theme.accent
+                                        font.pixelSize: 11
+                                        font.weight: Font.DemiBold
+                                    }
+                                    PmButton { text: "Game Data"; accent: true; onClicked: controller.selectGameDataDirectory() }
+                                    PmButton { text: "Write Patch"; enabled: controller.stagedChangeCount > 0; onClicked: controller.writePatch() }
+                                }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 8
+                                    PmTextField {
+                                        id: archiveInput
+                                        Layout.fillWidth: true
+                                        placeholderText: "Archive ID or found archive name"
+                                        inputMethodHints: Qt.ImhNoPredictiveText
+                                        onTextChanged: controller.searchFoundArchives(text)
+                                        onAccepted: controller.loadArchive(text)
+                                    }
+                                    PmButton { text: "Load"; enabled: archiveInput.text.length > 0; onClicked: controller.loadArchive(archiveInput.text) }
+                                }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    Layout.fillHeight: true
+                                    spacing: 12
+                                    Rectangle {
+                                        Layout.fillWidth: true
+                                        Layout.fillHeight: true
+                                        color: Theme.surface
+                                        border.width: 1
+                                        border.color: Theme.border
+                                        radius: 6
+                                        ColumnLayout {
+                                            anchors.fill: parent
+                                            anchors.margins: 10
+                                            spacing: 8
+                                            Text { text: "FOUND ARCHIVES"; color: Theme.textMuted; font.pixelSize: 10; font.weight: Font.DemiBold }
+                                            ListView {
+                                                id: foundArchiveList
+                                                Layout.fillWidth: true
+                                                Layout.fillHeight: true
+                                                model: foundArchivesModel
+                                                clip: true
+                                                spacing: 3
+                                                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                                                delegate: Rectangle {
+                                                    required property int index
+                                                    required property string archiveId
+                                                    required property string archiveDisplayName
+                                                    width: foundArchiveList.width - 8
+                                                    height: 52
+                                                    radius: 4
+                                                    color: foundArchiveMouse.containsMouse ? Theme.surfaceHover : "transparent"
+                                                    Text { anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 8; text: archiveDisplayName; color: Theme.text; font.pixelSize: 11; elide: Text.ElideRight }
+                                                    Text { anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; anchors.margins: 8; text: archiveId; color: Theme.textMuted; font.pixelSize: 10 }
+                                                    MouseArea { id: foundArchiveMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: controller.loadFoundArchive(index) }
+                                                }
+                                                Text { anchors.centerIn: parent; visible: foundArchiveList.count === 0; text: "Search by name to show found archives"; color: Theme.textMuted; font.pixelSize: 12 }
+                                            }
+                                        }
+                                    }
+                                    Rectangle {
+                                        visible: false
+                                        Layout.fillWidth: true
+                                        Layout.fillHeight: true
+                                        color: Theme.surface
+                                        border.width: 1
+                                        border.color: Theme.border
+                                        radius: 6
+                                        ColumnLayout {
+                                            anchors.fill: parent
+                                            anchors.margins: 10
+                                            spacing: 8
+                                            RowLayout {
+                                                Layout.fillWidth: true
+                                                Text { text: "PARTICLE ASSETS  " + controller.assetCount; color: Theme.textMuted; font.pixelSize: 10; font.weight: Font.DemiBold; Layout.fillWidth: true }
+                                                PmButton { text: "Import PNG"; enabled: assetPanel.selectedTexture; onClicked: controller.importSelectedTexturePng() }
+                                                PmButton { text: "Import DDS"; enabled: assetPanel.selectedTexture; onClicked: controller.importSelectedTextureDds() }
+                                            }
+                                            ListView {
+                                                id: assetList
+                                                Layout.fillWidth: true
+                                                Layout.fillHeight: true
+                                                model: assetLinksModel
+                                                clip: true
+                                                spacing: 3
+                                                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                                                onCountChanged: { assetPanel.selectedAssetIndex = -1; assetPanel.selectedTexture = false }
+                                                delegate: Rectangle {
+                                                    required property int index
+                                                    required property string assetKind
+                                                    required property string assetId
+                                                    required property string assetDetail
+                                                    required property bool assetAvailable
+                                                    required property bool assetReplaceable
+                                                    width: assetList.width - 8
+                                                    height: 58
+                                                    radius: 4
+                                                    color: assetPanel.selectedAssetIndex === index ? Theme.surfaceRaised : assetMouse.containsMouse ? Theme.surfaceHover : "transparent"
+                                                    border.width: assetPanel.selectedAssetIndex === index ? 1 : 0
+                                                    border.color: Theme.accent
+                                                    Text { anchors.left: parent.left; anchors.top: parent.top; anchors.margins: 8; text: assetKind.toUpperCase() + "  " + assetId; color: assetAvailable ? Theme.text : Theme.textMuted; font.pixelSize: 12; font.weight: Font.DemiBold }
+                                                    Text { anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; anchors.margins: 8; text: assetAvailable ? assetDetail : "Not present in the loaded archive"; color: Theme.textMuted; font.pixelSize: 10; elide: Text.ElideMiddle }
+                                                    MouseArea { id: assetMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { assetPanel.selectedAssetIndex = index; assetPanel.selectedTexture = assetReplaceable; controller.selectAsset(index) } }
+                                                }
+                                                Text { anchors.centerIn: parent; visible: assetList.count === 0; text: controller.hasDocument && controller.hasArchive ? "No linked assets found" : "Open an archive particle to inspect links"; color: Theme.textMuted; font.pixelSize: 12 }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }

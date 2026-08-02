@@ -8,6 +8,23 @@ from .particle import (
     ParticleSystem,
     Visualizer,
 )
+from .archive import (
+    ARCHIVE_MAGIC,
+    MATERIAL_TYPE_ID,
+    PARTICLE_TYPE_ID,
+    TEXTURE_TYPE_ID,
+    UNIT_TYPE_ID,
+    ArchiveEntry,
+    ArchiveError,
+    ArchiveReader,
+    AssetLink,
+    MaterialInfo,
+    TextureInfo,
+    SlimArchiveStore,
+    parse_material,
+    parse_texture,
+    parse_unit_material_ids,
+)
 
 __all__ = [
     "CURRENT_PARTICLE_VERSION",
@@ -18,5 +35,19 @@ __all__ = [
     "ParticleParseError",
     "ParticleSystem",
     "Visualizer",
+    "ARCHIVE_MAGIC",
+    "MATERIAL_TYPE_ID",
+    "PARTICLE_TYPE_ID",
+    "TEXTURE_TYPE_ID",
+    "UNIT_TYPE_ID",
+    "ArchiveEntry",
+    "ArchiveError",
+    "ArchiveReader",
+    "AssetLink",
+    "MaterialInfo",
+    "TextureInfo",
+    "SlimArchiveStore",
+    "parse_material",
+    "parse_texture",
+    "parse_unit_material_ids",
 ]
-

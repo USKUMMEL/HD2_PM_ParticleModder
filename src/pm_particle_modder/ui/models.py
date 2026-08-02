@@ -11,7 +11,7 @@ from PySide6.QtCore import (
     Slot,
 )
 
-from pm_particle_modder.core import ColorGraph, Graph, ParticleEffect, Visualizer
+from pm_particle_modder.core import ArchiveEntry, AssetLink, ColorGraph, Graph, ParticleEffect, Visualizer
 
 
 class DocumentListModel(QAbstractListModel):
@@ -42,7 +42,7 @@ class DocumentListModel(QAbstractListModel):
             return None
         document = self.documents[index.row()]
         if role == self.TitleRole:
-            return Path(document.path).name
+            return document.title or Path(document.path).name
         if role == self.PathRole:
             return str(document.path)
         if role == self.DirtyRole:
@@ -263,6 +263,126 @@ class VisualizerListModel(QAbstractListModel):
         if 0 <= row < len(self.entries):
             index = self.index(row, 0)
             self.dataChanged.emit(index, index, list(self.roleNames()))
+
+
+class ArchiveParticleListModel(QAbstractListModel):
+    IdRole = Qt.ItemDataRole.UserRole + 1
+    SizeRole = IdRole + 1
+
+    def __init__(self):
+        super().__init__()
+        self.entries: list[ArchiveEntry] = []
+
+    def roleNames(self):
+        return {
+            self.IdRole: QByteArray(b"resourceId"),
+            self.SizeRole: QByteArray(b"resourceSize"),
+        }
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.entries)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or not 0 <= index.row() < len(self.entries):
+            return None
+        entry = self.entries[index.row()]
+        if role == self.IdRole:
+            return str(entry.file_id)
+        if role == self.SizeRole:
+            return entry.toc_size
+        return None
+
+    def set_entries(self, entries: list[ArchiveEntry]) -> None:
+        self.beginResetModel()
+        self.entries = list(entries)
+        self.endResetModel()
+
+    def entry_at(self, row: int) -> ArchiveEntry:
+        return self.entries[row]
+
+
+class FoundArchiveListModel(QAbstractListModel):
+    IdRole = Qt.ItemDataRole.UserRole + 1
+    NameRole = IdRole + 1
+
+    def __init__(self):
+        super().__init__()
+        self.entries: list[tuple[str, str]] = []
+
+    def roleNames(self):
+        return {
+            self.IdRole: QByteArray(b"archiveId"),
+            self.NameRole: QByteArray(b"archiveDisplayName"),
+        }
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.entries)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or not 0 <= index.row() < len(self.entries):
+            return None
+        archive_id, name = self.entries[index.row()]
+        if role == self.IdRole:
+            return archive_id
+        if role == self.NameRole:
+            return name
+        return None
+
+    def set_entries(self, entries: list[tuple[str, str]]) -> None:
+        self.beginResetModel()
+        self.entries = list(entries)
+        self.endResetModel()
+
+    def entry_at(self, row: int) -> tuple[str, str]:
+        return self.entries[row]
+
+
+class AssetLinkListModel(QAbstractListModel):
+    KindRole = Qt.ItemDataRole.UserRole + 1
+    IdRole = KindRole + 1
+    DetailRole = IdRole + 1
+    AvailableRole = DetailRole + 1
+    ReplaceableRole = AvailableRole + 1
+
+    def __init__(self):
+        super().__init__()
+        self.links: list[AssetLink] = []
+
+    def roleNames(self):
+        return {
+            self.KindRole: QByteArray(b"assetKind"),
+            self.IdRole: QByteArray(b"assetId"),
+            self.DetailRole: QByteArray(b"assetDetail"),
+            self.AvailableRole: QByteArray(b"assetAvailable"),
+            self.ReplaceableRole: QByteArray(b"assetReplaceable"),
+        }
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.links)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or not 0 <= index.row() < len(self.links):
+            return None
+        link = self.links[index.row()]
+        if role == self.KindRole:
+            return link.kind
+        if role == self.IdRole:
+            return str(link.file_id)
+        if role == self.DetailRole:
+            return link.detail
+        if role == self.AvailableRole:
+            return link.available
+        if role == self.ReplaceableRole:
+            return link.kind == "texture" and link.available
+        return None
+
+    def set_links(self, links: list[AssetLink]) -> None:
+        self.beginResetModel()
+        self.links = list(links)
+        self.endResetModel()
+
+    def link_at(self, row: int) -> AssetLink:
+        return self.links[row]
 
 
 def _color_hex(color: list[float]) -> str:

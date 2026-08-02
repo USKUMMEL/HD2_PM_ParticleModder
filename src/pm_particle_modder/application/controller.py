@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
+from urllib.request import urlopen
 import xml.etree.ElementTree as ET
 
 from PySide6.QtCore import Property, QObject, QUrl, Signal, Slot
@@ -18,9 +19,20 @@ from PySide6.QtWidgets import (
     QMessageBox,
 )
 
-from pm_particle_modder.core import ColorGraph, Graph, ParticleEffect, ParticleParseError
+from pm_particle_modder.core import (
+    PARTICLE_TYPE_ID,
+    ArchiveError,
+    ArchiveReader,
+    ColorGraph,
+    Graph,
+    ParticleEffect,
+    ParticleParseError,
+)
 from pm_particle_modder.ui.models import (
+    ArchiveParticleListModel,
+    AssetLinkListModel,
     DocumentListModel,
+    FoundArchiveListModel,
     ParticleTableModel,
     VisualizerListModel,
 )
@@ -39,6 +51,9 @@ class Document:
     color_presets: list[list[tuple[int, int]] | None] = field(
         default_factory=lambda: [None, None]
     )
+    archive: ArchiveReader | None = None
+    archive_entry_id: int | None = None
+    title: str = ""
 
 
 class ValueEditCommand(QUndoCommand):
@@ -76,6 +91,7 @@ class ParticleController(QObject):
     stateChanged = Signal()
     currentDocumentChanged = Signal()
     statusChanged = Signal()
+    ARCHIVE_LIST_URL = "https://raw.githubusercontent.com/Boxofbiscuits97/HD2SDK-CommunityEdition/main/hashlists/archivehashes.json"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -86,7 +102,14 @@ class ParticleController(QObject):
         for model in (self.color_model, self.opacity_model, self.intensity_model):
             model.edit_handler = self.setTableCell
         self.visualizer_model = VisualizerListModel()
+        self.archive_particles_model = ArchiveParticleListModel()
+        self.found_archives_model = FoundArchiveListModel()
+        self.asset_links_model = AssetLinkListModel()
         self._current_index = -1
+        self._archive: ArchiveReader | None = None
+        self._game_data_directory: Path | None = None
+        self._archive_names: dict[str, str] | None = None
+        self._selected_asset_index = -1
         self._status = "Ready"
 
     @Property(int, notify=currentDocumentChanged)
@@ -101,6 +124,34 @@ class ParticleController(QObject):
     def documentCount(self) -> int:
         return len(self.documents_model.documents)
 
+    @Property(bool, notify=stateChanged)
+    def hasArchive(self) -> bool:
+        return self._archive is not None
+
+    @Property(bool, notify=stateChanged)
+    def hasGameDataDirectory(self) -> bool:
+        return self._game_data_directory is not None
+
+    @Property(str, notify=stateChanged)
+    def gameDataDirectory(self) -> str:
+        return str(self._game_data_directory) if self._game_data_directory else "Game data folder not selected"
+
+    @Property(str, notify=stateChanged)
+    def archiveName(self) -> str:
+        return self._archive.path.name if self._archive else "No archive loaded"
+
+    @Property(int, notify=stateChanged)
+    def archiveParticleCount(self) -> int:
+        return self.archive_particles_model.rowCount()
+
+    @Property(int, notify=stateChanged)
+    def assetCount(self) -> int:
+        return self.asset_links_model.rowCount()
+
+    @Property(int, notify=stateChanged)
+    def stagedChangeCount(self) -> int:
+        return len(self._archive.staged_entries) if self._archive else 0
+
     @Property("QVariantList", notify=stateChanged)
     def groupNames(self):
         return sorted(
@@ -111,7 +162,7 @@ class ParticleController(QObject):
     @Property(str, notify=currentDocumentChanged)
     def currentTitle(self) -> str:
         document = self.current_document
-        return document.path.name if document else "No file loaded"
+        return (document.title or document.path.name) if document else "No file loaded"
 
     @Property(str, notify=currentDocumentChanged)
     def currentPath(self) -> str:
@@ -159,9 +210,96 @@ class ParticleController(QObject):
             None,
             "Open particle files",
             "",
-            "Particle Files (*.particles);;PM Projects (*.pmod);;All Files (*.*)",
+            "Particle Files (*.particle *.particles);;PM Projects (*.pmod);;All Files (*.*)",
         )
         self._open_paths([Path(path) for path in paths])
+
+    @Slot()
+    def openArchive(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            None,
+            "Open Helldivers 2 archive",
+            "",
+            "Archive files (*);;All Files (*.*)",
+        )
+        if path:
+            self._open_archive(Path(path))
+
+    @Slot()
+    def selectGameDataDirectory(self) -> None:
+        directory = QFileDialog.getExistingDirectory(None, "Select Helldivers 2 data folder")
+        if not directory:
+            return
+        data_directory = Path(directory).resolve()
+        if not (data_directory / "bundles.nxa").is_file():
+            self._show_error("Invalid game data folder", "Could not find bundles.nxa in this folder.")
+            return
+        self._game_data_directory = data_directory
+        self._set_status(f"Game data folder set: {data_directory}")
+        self.stateChanged.emit()
+
+    @Slot(str)
+    def loadArchive(self, value: str) -> None:
+        archive_id = value.strip().lower().removeprefix("0x")
+        if len(archive_id) != 16 or any(character not in "0123456789abcdef" for character in archive_id):
+            self.searchFoundArchives(value)
+            return
+        self._load_slim_archive(archive_id, self._load_archive_names().get(archive_id))
+
+    @Slot(str)
+    def searchFoundArchives(self, query: str) -> None:
+        normalized_query = query.strip().casefold()
+        matches = sorted([
+            (archive_id, name) for archive_id, name in self._load_archive_names().items()
+            if not normalized_query or normalized_query in name.casefold()
+        ], key=lambda item: item[1].casefold())
+        self.found_archives_model.set_entries(matches)
+        self.stateChanged.emit()
+
+    @Slot(int)
+    def loadFoundArchive(self, row: int) -> None:
+        if not 0 <= row < self.found_archives_model.rowCount():
+            return
+        archive_id, display_name = self.found_archives_model.entry_at(row)
+        self._load_slim_archive(archive_id, display_name)
+
+    def _load_slim_archive(self, archive_id: str, display_name: str | None) -> None:
+        if self._game_data_directory is None:
+            self.selectGameDataDirectory()
+            if self._game_data_directory is None:
+                return
+        try:
+            archive = ArchiveReader.open_slim(self._game_data_directory, archive_id)
+        except (OSError, ArchiveError) as error:
+            self._show_error("Unable to load Slim archive", str(error))
+            return
+        self._activate_archive(archive)
+        group = f"Archive: {display_name or archive_id}"
+        opened = 0
+        last_document = None
+        for entry in archive.entries_of_type(PARTICLE_TYPE_ID):
+            document = self._open_archive_particle(entry, group, select=False)
+            if document is not None:
+                opened += 1
+                last_document = document
+        if last_document is not None:
+            self._sort_documents(last_document)
+        self._set_status(f"Loaded {opened} particle resource(s) from {group}")
+
+    def _load_archive_names(self) -> dict[str, str]:
+        if self._archive_names is not None:
+            return self._archive_names
+        try:
+            with urlopen(self.ARCHIVE_LIST_URL, timeout=8) as response:
+                raw_data = json.loads(response.read().decode("utf-8"))
+            self._archive_names = {
+                archive_id.lower(): f"{category_name}: {name}"
+                for category_name, category in raw_data.items()
+                for archive_id, name in category.items()
+            }
+        except (OSError, ValueError, UnicodeDecodeError):
+            self._archive_names = {}
+        return self._archive_names
 
     @Slot("QVariantList")
     def openUrls(self, urls) -> None:
@@ -178,6 +316,62 @@ class ParticleController(QObject):
                 self._open_project(path)
             else:
                 self._open_particle(path)
+
+    def _open_archive(self, path: Path) -> None:
+        try:
+            archive = ArchiveReader.open(path)
+        except (OSError, ArchiveError) as error:
+            self._show_error("Unable to open archive", f"{path.name}\n\n{error}")
+            return
+        self._activate_archive(archive)
+        self._set_status(
+            f"Loaded {path.name}: {self.archive_particles_model.rowCount()} particle resource(s)"
+        )
+
+    def _activate_archive(self, archive: ArchiveReader) -> None:
+        self._archive = archive
+        self.archive_particles_model.set_entries(archive.entries_of_type(PARTICLE_TYPE_ID))
+        self.asset_links_model.set_links([])
+        self._selected_asset_index = -1
+        self.stateChanged.emit()
+
+    @Slot(int)
+    def openArchiveParticle(self, row: int) -> None:
+        if self._archive is None or not 0 <= row < self.archive_particles_model.rowCount():
+            return
+        entry = self.archive_particles_model.entry_at(row)
+        self._open_archive_particle(entry, "", select=True)
+
+    def _open_archive_particle(self, entry, group: str, select: bool):
+        if self._archive is None:
+            return None
+        path = self._archive.path.with_name(f"{self._archive.path.name} [{entry.file_id}].particles")
+        try:
+            effect = ParticleEffect.from_bytes(entry.toc_data)
+        except ParticleParseError as error:
+            self._show_error("Unable to open archive particle", f"{entry.file_id}\n\n{error}")
+            return
+        for index, document in enumerate(self.documents_model.documents):
+            if document.path == path:
+                if group:
+                    document.group = group
+                if select:
+                    self.setCurrentDocument(index)
+                return document
+        stack = QUndoStack(self)
+        document = Document(
+            path, effect, stack, group=group, archive=self._archive,
+            archive_entry_id=entry.file_id, title=f"{entry.file_id}.particle",
+        )
+        stack.cleanChanged.connect(lambda _clean, doc=document: self._document_state_changed(doc))
+        stack.canUndoChanged.connect(lambda _value: self.stateChanged.emit())
+        stack.canRedoChanged.connect(lambda _value: self.stateChanged.emit())
+        document_row = self.documents_model.append(document)
+        stack.setClean()
+        if select:
+            self.setCurrentDocument(document_row)
+            self._set_status(f"Opened archive particle {entry.file_id}")
+        return document
 
     def _open_particle(
         self, path: Path, note: str = "", group: str = ""
@@ -268,12 +462,17 @@ class ParticleController(QObject):
     @Slot()
     def saveCurrent(self) -> bool:
         document = self.current_document
+        if document is not None and document.archive is not None:
+            return self._stage_archive_document(document)
         return self._save_document(document) if document else False
 
     @Slot()
     def saveCurrentAs(self) -> bool:
         document = self.current_document
         if document is None:
+            return False
+        if document.archive is not None:
+            self._show_error("Archive particle", "Use Write Patch to save archive resources.")
             return False
         path, _ = QFileDialog.getSaveFileName(
             None,
@@ -288,7 +487,10 @@ class ParticleController(QObject):
         success = True
         for document in self.documents_model.documents:
             if not document.undo_stack.isClean():
-                success = self._save_document(document) and success
+                if document.archive is not None:
+                    success = self._stage_archive_document(document) and success
+                else:
+                    success = self._save_document(document) and success
         return success
 
     @Slot()
@@ -375,6 +577,89 @@ class ParticleController(QObject):
             self._show_error("Unable to save particle file", f"{target.name}\n\n{error}")
             return False
 
+    def _stage_archive_document(self, document: Document) -> bool:
+        if document.archive is None or document.archive_entry_id is None:
+            return False
+        entry = document.archive.get_entry(document.archive_entry_id, PARTICLE_TYPE_ID)
+        if entry is None:
+            self._show_error("Unable to stage particle", "The source archive resource is unavailable.")
+            return False
+        try:
+            output = document.effect.to_bytes()
+            document.archive.stage(entry.with_data(output, entry.gpu_data, entry.stream_data))
+            document.effect.original_data = output
+            document.undo_stack.setClean()
+            self.documents_model.refresh(self.documents_model.documents.index(document))
+            self._refresh_assets()
+            self._set_status(f"Staged archive particle {document.archive_entry_id}")
+            return True
+        except (ArchiveError, ValueError) as error:
+            self._show_error("Unable to stage particle", str(error))
+            return False
+
+    @Slot(int)
+    def selectAsset(self, row: int) -> None:
+        self._selected_asset_index = row if 0 <= row < self.asset_links_model.rowCount() else -1
+
+    @Slot()
+    def importSelectedTexturePng(self) -> None:
+        link = self._selected_texture_link()
+        if link is None or self._archive is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(None, "Replace texture from PNG", "", "PNG (*.png)")
+        if not path:
+            return
+        try:
+            self._archive.replace_texture_from_png(link.file_id, Path(path))
+            self._refresh_assets()
+            self._set_status(f"Staged PNG replacement for texture {link.file_id}")
+        except ArchiveError as error:
+            self._show_error("Unable to import PNG texture", str(error))
+
+    @Slot()
+    def importSelectedTextureDds(self) -> None:
+        link = self._selected_texture_link()
+        if link is None or self._archive is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(None, "Replace texture from DDS", "", "DDS (*.dds)")
+        if not path:
+            return
+        try:
+            self._archive.replace_texture_from_dds(link.file_id, Path(path).read_bytes())
+            self._refresh_assets()
+            self._set_status(f"Staged DDS replacement for texture {link.file_id}")
+        except (OSError, ArchiveError) as error:
+            self._show_error("Unable to import DDS texture", str(error))
+
+    @Slot()
+    def writePatch(self) -> None:
+        if self._archive is None or not self._archive.staged_entries:
+            return
+        default_path = str(self._archive.path.with_name(self._archive.path.name + ".patch_0"))
+        path, _ = QFileDialog.getSaveFileName(None, "Write PM patch", default_path, "Patch files (*)")
+        if not path:
+            return
+        try:
+            output = self._archive.write_patch(path)
+            self._set_status(f"Wrote patch {output.name}")
+        except (OSError, ArchiveError) as error:
+            self._show_error("Unable to write patch", str(error))
+
+    def _selected_texture_link(self):
+        if not 0 <= self._selected_asset_index < self.asset_links_model.rowCount():
+            return None
+        link = self.asset_links_model.link_at(self._selected_asset_index)
+        return link if link.kind == "texture" and link.available else None
+
+    def _refresh_assets(self) -> None:
+        document = self.current_document
+        if document is not None and document.archive is not None:
+            self.asset_links_model.set_links(document.archive.particle_assets(document.effect))
+        else:
+            self.asset_links_model.set_links([])
+        self._selected_asset_index = -1
+        self.stateChanged.emit()
+
     @Slot(int)
     def setCurrentDocument(self, index: int) -> None:
         if index == self._current_index:
@@ -385,6 +670,7 @@ class ParticleController(QObject):
         self.opacity_model.set_effect(effect)
         self.intensity_model.set_effect(effect)
         self.visualizer_model.set_effect(effect)
+        self._refresh_assets()
         self.currentDocumentChanged.emit()
         self.stateChanged.emit()
 
@@ -803,6 +1089,7 @@ class ParticleController(QObject):
         def apply(new_value):
             setattr(visualizer, attribute, new_value)
             self.visualizer_model.refresh(row)
+            self._refresh_assets()
 
         self._push_edit(f"Edit {field} ID", apply, old_value, value)
 
