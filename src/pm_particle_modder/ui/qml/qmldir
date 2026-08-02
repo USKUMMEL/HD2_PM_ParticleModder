@@ -1,0 +1,4 @@
+singleton Theme 1.0 Theme.qml
+PmButton 1.0 PmButton.qml
+PmTextField 1.0 PmTextField.qml
+GraphTable 1.0 GraphTable.qml
