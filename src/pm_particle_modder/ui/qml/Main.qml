@@ -115,7 +115,7 @@ ApplicationWindow {
             Rectangle { Layout.preferredWidth: 1; Layout.fillHeight: true; Layout.topMargin: 11; Layout.bottomMargin: 11; color: Theme.border }
             PmButton { text: "Open"; accent: true; tooltip: "Open particle files"; onClicked: controller.openFiles() }
             PmButton { text: "Game Data"; tooltip: "Select the Helldivers 2 data folder"; onClicked: controller.selectGameDataDirectory() }
-            PmButton { text: "Load Archive"; tooltip: "Load an archive by ID or found archive name"; onClicked: window.sectionIndex = 5 }
+            PmButton { text: "Load Archive"; tooltip: "Load an archive by ID or found archive name"; onClicked: window.sectionIndex = 6 }
             PmButton { text: "Save"; enabled: controller.hasDocument; tooltip: "Save current file"; onClicked: controller.saveCurrent() }
             PmButton { text: "Save As"; enabled: controller.hasDocument; tooltip: "Save current file as"; onClicked: controller.saveCurrentAs() }
             PmButton { text: "Save All"; enabled: controller.hasDocument; tooltip: "Save all modified files"; onClicked: controller.saveAll() }
@@ -339,7 +339,7 @@ ApplicationWindow {
                         font.weight: Font.DemiBold
                     }
                     Repeater {
-                        model: ["Color", "Opacity", "Intensity", "Lifetime", "Visualizers", "Archive"]
+                        model: ["Color", "Opacity", "Intensity", "Lifetime", "Visualizers", "Texture", "Archive"]
                         delegate: Rectangle {
                             id: navItem
                             required property int index
@@ -519,8 +519,8 @@ ApplicationWindow {
                         objectName: "editorStack"
                         Layout.fillWidth: true
                         Layout.fillHeight: true
-                        currentIndex: controller.hasDocument || window.sectionIndex === 5
-                                      ? window.sectionIndex : 6
+                        currentIndex: controller.hasDocument || window.sectionIndex === 6
+                                      ? window.sectionIndex : 7
 
                         GraphTable {
                             objectName: "colorGraphTable"
@@ -639,6 +639,283 @@ ApplicationWindow {
                                     text: "No editable visualizers in this particle file"
                                     color: Theme.textMuted
                                     font.pixelSize: 14
+                                }
+                            }
+                        }
+
+                        Item {
+                            id: texturePanel
+                            property int selectedTextureIndex: -1
+                            property bool listView: controller.textureListView
+                            ColumnLayout {
+                                anchors.fill: parent
+                                anchors.margins: 16
+                                spacing: 10
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    Text { text: "TEXTURE"; color: Theme.text; font.pixelSize: 15; font.weight: Font.DemiBold; Layout.fillWidth: true }
+                                    Rectangle {
+                                        Layout.preferredWidth: 122
+                                        Layout.preferredHeight: 29
+                                        radius: 4
+                                        color: Theme.surface
+                                        border.color: Theme.border
+                                        Row {
+                                            anchors.fill: parent
+                                            anchors.margins: 2
+                                            Repeater {
+                                                model: ["Viewer", "List"]
+                                                delegate: Rectangle {
+                                                    required property int index
+                                                    required property string modelData
+                                                    width: 58
+                                                    height: parent.height
+                                                    radius: 3
+                                                    color: (texturePanel.listView === (index === 1)) ? Theme.surfaceRaised : "transparent"
+                                                    Text { anchors.centerIn: parent; text: modelData; color: (texturePanel.listView === (index === 1)) ? Theme.text : Theme.textMuted; font.pixelSize: 10; font.weight: Font.DemiBold }
+                                                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: controller.setTextureListView(index === 1) }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    PmButton { text: "Import PNG"; enabled: controller.hasSelectedTexture; onClicked: controller.importSelectedTexturePng() }
+                                    PmButton { text: "Import DDS"; enabled: controller.hasSelectedTexture; onClicked: controller.importSelectedTextureDds() }
+                                }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    visible: !texturePanel.listView
+                                    Layout.preferredHeight: texturePanel.listView ? 0 : 38
+                                    spacing: 10
+                                    ComboBox {
+                                        id: systemSelector
+                                        Layout.fillWidth: true
+                                        Layout.preferredWidth: !texturePanel.listView && controller.hasTextureMaterialChoice ? 1 : 2
+                                        Layout.preferredHeight: 38
+                                        model: controller.textureSystemOptions
+                                        enabled: model.length > 0
+                                        currentIndex: 0
+                                        onActivated: controller.selectTextureSystem(currentIndex)
+                                        contentItem: Text {
+                                            leftPadding: 11
+                                            rightPadding: 30
+                                            text: systemSelector.displayText
+                                            color: Theme.text
+                                            font.pixelSize: 12
+                                            verticalAlignment: Text.AlignVCenter
+                                            elide: Text.ElideRight
+                                        }
+                                        background: Rectangle { radius: 4; color: Theme.surface; border.color: systemSelector.activeFocus ? Theme.focus : Theme.border; border.width: 1 }
+                                    }
+                                    ComboBox {
+                                        id: materialSelector
+                                        Layout.fillWidth: true
+                                        visible: !texturePanel.listView && controller.hasTextureMaterialChoice
+                                        Layout.preferredHeight: 38
+                                        model: controller.textureMaterialOptions
+                                        enabled: model.length > 0
+                                        currentIndex: 0
+                                        onActivated: controller.selectTextureMaterial(currentIndex)
+                                        contentItem: Text {
+                                            leftPadding: 11
+                                            rightPadding: 30
+                                            text: materialSelector.displayText.length > 0 ? "Material " + materialSelector.displayText : "No material"
+                                            color: Theme.text
+                                            font.pixelSize: 12
+                                            verticalAlignment: Text.AlignVCenter
+                                            elide: Text.ElideMiddle
+                                        }
+                                        background: Rectangle { radius: 4; color: Theme.surface; border.color: materialSelector.activeFocus ? Theme.focus : Theme.border; border.width: 1 }
+                                    }
+                                }
+                                Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.border }
+                                Rectangle {
+                                    Layout.fillWidth: true
+                                    Layout.fillHeight: true
+                                    visible: !texturePanel.listView
+                                    color: Theme.surface
+                                    border.color: Theme.border
+                                    border.width: 1
+                                    radius: 5
+                                    RowLayout {
+                                        anchors.fill: parent
+                                        anchors.margins: 10
+                                        spacing: 10
+                                        ListView {
+                                            id: textureList
+                                            Layout.preferredWidth: 290
+                                            Layout.fillHeight: true
+                                            model: textureBindingsModel
+                                            clip: true
+                                            spacing: 3
+                                            ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                                            onCountChanged: texturePanel.selectedTextureIndex = -1
+                                            delegate: Rectangle {
+                                                required property int index
+                                                required property string textureId
+                                                required property string textureDetail
+                                                required property bool textureAvailable
+                                                width: textureList.width - 7
+                                                height: 56
+                                                radius: 4
+                                                color: texturePanel.selectedTextureIndex === index ? Theme.surfaceRaised : textureMouse.containsMouse ? Theme.surfaceHover : "transparent"
+                                                border.width: texturePanel.selectedTextureIndex === index ? 1 : 0
+                                                border.color: Theme.accent
+                                                Text { anchors.left: parent.left; anchors.top: parent.top; anchors.margins: 8; text: textureId; color: textureAvailable ? Theme.text : Theme.textMuted; font.pixelSize: 12; font.weight: Font.DemiBold }
+                                                Text { anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; anchors.margins: 8; text: textureAvailable ? textureDetail : "Find in other archives when selected"; color: Theme.textMuted; font.pixelSize: 10; elide: Text.ElideMiddle }
+                                                MouseArea { id: textureMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: { texturePanel.selectedTextureIndex = index; controller.selectTexture(index) } }
+                                            }
+                                            Text { anchors.centerIn: parent; width: parent.width - 28; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.WordWrap; visible: textureList.count === 0; text: controller.hasDocument ? "No texture is linked to this material" : "Open a particle from an archive to load textures"; color: Theme.textMuted; font.pixelSize: 12 }
+                                        }
+                                        Rectangle { Layout.preferredWidth: 1; Layout.fillHeight: true; color: Theme.border }
+                                        Item {
+                                            Layout.fillWidth: true
+                                            Layout.fillHeight: true
+                                            Image {
+                                                anchors.fill: parent
+                                                anchors.margins: 12
+                                                source: controller.texturePreviewUrl
+                                                fillMode: Image.PreserveAspectFit
+                                                asynchronous: true
+                                                visible: source !== "" && status === Image.Ready
+                                            }
+                                            Text {
+                                                anchors.centerIn: parent
+                                                width: parent.width - 48
+                                                horizontalAlignment: Text.AlignHCenter
+                                                wrapMode: Text.WordWrap
+                                                text: controller.texturePreviewMessage
+                                                color: Theme.textMuted
+                                                font.pixelSize: 12
+                                                visible: controller.texturePreviewUrl === ""
+                                            }
+                                            Text {
+                                                anchors.horizontalCenter: parent.horizontalCenter
+                                                anchors.bottom: parent.bottom
+                                                anchors.bottomMargin: 8
+                                                text: controller.texturePreviewMessage
+                                                color: Theme.textMuted
+                                                font.pixelSize: 11
+                                                visible: controller.texturePreviewUrl !== ""
+                                            }
+                                        }
+                                    }
+                                }
+                                Rectangle {
+                                    Layout.fillWidth: true
+                                    Layout.fillHeight: true
+                                    visible: texturePanel.listView
+                                    color: Theme.surface
+                                    border.color: Theme.border
+                                    border.width: 1
+                                    radius: 5
+                                    ListView {
+                                        id: textureOverviewList
+                                        anchors.fill: parent
+                                        anchors.margins: 10
+                                        model: controller.textureOverviewRows
+                                        clip: true
+                                        spacing: 7
+                                        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                                        delegate: Rectangle {
+                                            required property var modelData
+                                            width: textureOverviewList.width - 8
+                                            height: 126
+                                            color: Theme.background
+                                            radius: 4
+                                            border.color: Theme.border
+                                            border.width: 1
+                                            RowLayout {
+                                                anchors.fill: parent
+                                                anchors.margins: 9
+                                                spacing: 10
+                                                Text {
+                                                    Layout.preferredWidth: 188
+                                                    Layout.fillHeight: true
+                                                    text: "Particle System " + (modelData.systemIndex + 1) + ":"
+                                                    color: Theme.text
+                                                    font.pixelSize: 12
+                                                    font.weight: Font.DemiBold
+                                                    verticalAlignment: Text.AlignVCenter
+                                                    elide: Text.ElideMiddle
+                                                }
+                                                Rectangle { Layout.preferredWidth: 1; Layout.fillHeight: true; color: Theme.border }
+                                                Flickable {
+                                                    Layout.fillWidth: true
+                                                    Layout.fillHeight: true
+                                                    contentWidth: overviewTextures.width
+                                                    contentHeight: height
+                                                    clip: true
+                                                    boundsBehavior: Flickable.StopAtBounds
+                                                    Row {
+                                                        id: overviewTextures
+                                                        spacing: 7
+                                                        Repeater {
+                                                            model: modelData.textures
+                                                            delegate: Rectangle {
+                                                                required property var modelData
+                                                                width: 108
+                                                                height: 106
+                                                                radius: 4
+                                                                color: overviewMouse.containsMouse ? Theme.surfaceHover : Theme.surface
+                                                                property bool isSelected: controller.selectedTextureSystemIndex === modelData.systemIndex
+                                                                                          && controller.selectedTextureMaterialId === modelData.materialId
+                                                                                          && controller.selectedTextureId === modelData.textureId
+                                                                border.color: isSelected ? Theme.accentStrong : (modelData.available ? Theme.borderStrong : Theme.border)
+                                                                border.width: isSelected ? 2 : 1
+                                                                Image {
+                                                                    anchors.left: parent.left
+                                                                    anchors.right: parent.right
+                                                                    anchors.top: parent.top
+                                                                    anchors.bottom: overviewTextureId.top
+                                                                    anchors.margins: 5
+                                                                    source: modelData.previewUrl
+                                                                    fillMode: Image.PreserveAspectFit
+                                                                    asynchronous: true
+                                                                    visible: modelData.previewState === "ready" && status === Image.Ready
+                                                                }
+                                                                Text {
+                                                                    anchors.centerIn: parent
+                                                                    width: parent.width - 12
+                                                                    visible: modelData.previewState !== "ready"
+                                                                    text: modelData.previewState === "loading" ? "Loading..." : "Can't load"
+                                                                    color: modelData.available ? Theme.text : Theme.textMuted
+                                                                    font.pixelSize: 10
+                                                                    horizontalAlignment: Text.AlignHCenter
+                                                                    wrapMode: Text.WordWrap
+                                                                }
+                                                                Text {
+                                                                    id: overviewTextureId
+                                                                    anchors.left: parent.left
+                                                                    anchors.right: parent.right
+                                                                    anchors.bottom: parent.bottom
+                                                                    anchors.margins: 5
+                                                                    text: modelData.textureId
+                                                                    color: Theme.textMuted
+                                                                    font.pixelSize: 9
+                                                                    elide: Text.ElideMiddle
+                                                                    visible: modelData.previewUrl !== ""
+                                                                }
+                                                                MouseArea {
+                                                                    id: overviewMouse
+                                                                    anchors.fill: parent
+                                                                    hoverEnabled: true
+                                                                    cursorShape: Qt.PointingHandCursor
+                                                                    onClicked: controller.selectTextureBinding(modelData.systemIndex, modelData.materialId, modelData.textureId)
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Text {
+                                            anchors.centerIn: parent
+                                            visible: textureOverviewList.count === 0
+                                            text: controller.hasDocument ? "No textures are linked to this particle" : "Open a particle from an archive to load textures"
+                                            color: Theme.textMuted
+                                            font.pixelSize: 12
+                                        }
+                                    }
                                 }
                             }
                         }

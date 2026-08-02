@@ -37,6 +37,7 @@ def main() -> int:
     context.setContextProperty("archiveParticlesModel", controller.archive_particles_model)
     context.setContextProperty("foundArchivesModel", controller.found_archives_model)
     context.setContextProperty("assetLinksModel", controller.asset_links_model)
+    context.setContextProperty("textureBindingsModel", controller.texture_bindings_model)
 
     qml_path = package_dir / "ui" / "qml" / "Main.qml"
     engine.load(QUrl.fromLocalFile(str(qml_path)))

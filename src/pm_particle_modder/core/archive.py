@@ -82,6 +82,17 @@ class AssetLink:
 
 
 @dataclass(frozen=True)
+class TextureBinding:
+    system_index: int
+    material_id: int
+    texture_id: int
+    detail: str
+    available: bool
+    preview_url: str = ""
+    preview_state: str = ""
+
+
+@dataclass(frozen=True)
 class SlimPackagePart:
     archive_offset: int
     bundle_offset: int
@@ -108,20 +119,65 @@ class SlimArchiveStore:
             raise ArchiveError("bundles.nxa is too small.")
         self.packages = self._parse_packages(mapping)
         self._chunk_offsets: dict[str, dict[int, int]] = {}
+        self._readers: dict[str, ArchiveReader] = {}
+        self._resource_locations: dict[tuple[int, int], str | None] = {}
 
     def open_archive(self, archive_id: str) -> ArchiveReader:
         normalized = archive_id.lower().removeprefix("0x")
+        existing = self._readers.get(normalized)
+        if existing is not None:
+            return existing
         package = self.packages.get(normalized)
         if package is None:
             raise ArchiveError(f"Archive ID {archive_id} was not found in bundles.nxa.")
         toc = self._reconstruct(package)
-        gpu = self._reconstruct_optional(normalized + ".gpu_resources")
-        stream = self._reconstruct_optional(normalized + ".stream")
-        return ArchiveReader(self.data_directory / normalized, toc, gpu, stream)
+        reader = ArchiveReader(
+            self.data_directory / normalized, toc, b"", b"", self,
+            lambda entry: self._load_entry_data(package, entry),
+        )
+        self._readers[normalized] = reader
+        return reader
 
-    def _reconstruct_optional(self, package_name: str) -> bytes:
-        package = self.packages.get(package_name)
-        return self._reconstruct(package) if package else b""
+    def find_resource(self, file_id: int, type_id: int) -> ArchiveEntry | None:
+        """Resolve one resource lazily from another logical Slim archive."""
+        key = (file_id, type_id)
+        location = self._resource_locations.get(key, ...)
+        if location is not ...:
+            return self.open_archive(location).get_entry(file_id, type_id) if location else None
+
+        for package in self.packages.values():
+            if package.name.endswith((".gpu_resources", ".stream")):
+                continue
+            if not self._package_contains(package, key):
+                continue
+            self._resource_locations[key] = package.name
+            return self.open_archive(package.name).get_entry(file_id, type_id)
+        self._resource_locations[key] = None
+        return None
+
+    def _package_contains(self, package: SlimPackage, key: tuple[int, int]) -> bool:
+        if not package.parts:
+            return False
+        try:
+            # The first resource is normally a full ToC, but some packages split the
+            # entry table into later resources. Read only the needed metadata prefix.
+            toc = self._reconstruct_prefix(package, 12)
+            if len(toc) < 12 or _u32(toc, 0) != ARCHIVE_MAGIC:
+                return False
+            toc_size = 72 + _u32(toc, 4) * 32 + _u32(toc, 8) * 80
+            if toc_size > package.size or toc_size > 64 * 1024 * 1024:
+                return False
+            toc = self._reconstruct_prefix(package, toc_size)
+            return _toc_contains_resource(toc, key)
+        except ArchiveError:
+            return False
+
+    def _load_entry_data(self, package: SlimPackage, entry: ArchiveEntry) -> ArchiveEntry:
+        return entry.with_data(
+            entry.toc_data,
+            self._read_package_span(package.name + ".gpu_resources", entry.gpu_offset, entry.gpu_size),
+            self._read_package_span(package.name + ".stream", entry.stream_offset, entry.stream_size),
+        )
 
     def _parse_packages(self, data: bytes) -> dict[str, SlimPackage]:
         package_count = _u32(data, 16)
@@ -155,6 +211,57 @@ class SlimArchiveStore:
                 raise ArchiveError(f"Slim package {package.name} has unordered parts.")
             data = self._read_bundle_range(part.bundle_index, part.bundle_offset, needed)
             output[part.archive_offset:part.archive_offset + needed] = data[:needed]
+        return bytes(output)
+
+    def _reconstruct_prefix(self, package: SlimPackage, size: int) -> bytes:
+        """Read the beginning of a logical package without rebuilding its payload."""
+        target_size = min(max(size, 0), package.size)
+        output = bytearray(target_size)
+        for index, part in enumerate(package.parts):
+            if part.archive_offset >= target_size:
+                break
+            next_offset = (
+                package.parts[index + 1].archive_offset
+                if index + 1 < len(package.parts) else package.size
+            )
+            part_size = min(next_offset, target_size) - part.archive_offset
+            if part_size <= 0:
+                continue
+            data = self._read_bundle_range(part.bundle_index, part.bundle_offset, part_size)
+            output[part.archive_offset:part.archive_offset + part_size] = data[:part_size]
+        return bytes(output)
+
+    def _read_package_span(self, package_name: str, offset: int, size: int) -> bytes:
+        """Read only one logical range from a Slim package sidecar."""
+        if size == 0:
+            return b""
+        package = self.packages.get(package_name)
+        if package is None:
+            raise ArchiveError(f"Slim sidecar {package_name} is missing.")
+        end = offset + size
+        if offset < 0 or end > package.size:
+            raise ArchiveError(f"Requested range is outside Slim sidecar {package_name}.")
+        output = bytearray(size)
+        written = 0
+        for index, part in enumerate(package.parts):
+            part_end = (
+                package.parts[index + 1].archive_offset
+                if index + 1 < len(package.parts) else package.size
+            )
+            overlap_start = max(offset, part.archive_offset)
+            overlap_end = min(end, part_end)
+            if overlap_start >= overlap_end:
+                continue
+            data = self._read_bundle_range(
+                part.bundle_index, part.bundle_offset, overlap_end - part.archive_offset
+            )
+            source_start = overlap_start - part.archive_offset
+            target_start = overlap_start - offset
+            length = overlap_end - overlap_start
+            output[target_start:target_start + length] = data[source_start:source_start + length]
+            written += length
+        if written != size:
+            raise ArchiveError(f"Slim sidecar {package_name} has a gap in the requested range.")
         return bytes(output)
 
     def _read_bundle_range(self, bundle_index: int, offset: int, size: int) -> bytes:
@@ -197,14 +304,21 @@ class SlimArchiveStore:
 class ArchiveReader:
     """Read one standalone Stingray package without loading the Blender SDK."""
 
-    def __init__(self, path: Path, toc_data: bytes, gpu_data: bytes, stream_data: bytes):
+    def __init__(self, path: Path, toc_data: bytes, gpu_data: bytes, stream_data: bytes,
+                 slim_store: SlimArchiveStore | None = None, entry_loader=None):
         self.path = path
         self.toc_data = bytes(toc_data)
         self.gpu_data = bytes(gpu_data)
         self.stream_data = bytes(stream_data)
-        self.entries = _parse_entries(self.toc_data, self.gpu_data, self.stream_data)
+        self.entries = _parse_entries(
+            self.toc_data, self.gpu_data, self.stream_data, allow_missing_sidecars=entry_loader is not None
+        )
         self._by_key = {(entry.file_id, entry.type_id): entry for entry in self.entries}
         self.staged_entries: dict[tuple[int, int], ArchiveEntry] = {}
+        self._slim_store = slim_store
+        self._entry_loader = entry_loader
+        self._loaded_entry_keys = set(self._by_key) if entry_loader is None else set()
+        self._resolved_entries: dict[tuple[int, int], ArchiveEntry | None] = {}
 
     @classmethod
     def open(cls, path: str | Path) -> ArchiveReader:
@@ -223,14 +337,35 @@ class ArchiveReader:
         return SlimArchiveStore(data_directory).open_archive(archive_id)
 
     def get_entry(self, file_id: int, type_id: int) -> ArchiveEntry | None:
-        return self.staged_entries.get((file_id, type_id)) or self._by_key.get((file_id, type_id))
+        key = (file_id, type_id)
+        staged = self.staged_entries.get(key)
+        if staged is not None:
+            return staged
+        entry = self._by_key.get(key)
+        if entry is not None and key not in self._loaded_entry_keys:
+            entry = self._entry_loader(entry)
+            self._by_key[key] = entry
+            self._loaded_entry_keys.add(key)
+        return entry
+
+    def find_entry(self, file_id: int, type_id: int) -> ArchiveEntry | None:
+        entry = self.get_entry(file_id, type_id)
+        if entry is not None:
+            return entry
+        key = (file_id, type_id)
+        if key not in self._resolved_entries:
+            self._resolved_entries[key] = (
+                self._slim_store.find_resource(file_id, type_id) if self._slim_store else None
+            )
+        return self._resolved_entries[key]
 
     def entries_of_type(self, type_id: int) -> list[ArchiveEntry]:
-        return [entry for entry in self.entries if entry.type_id == type_id]
+        return [
+            self.get_entry(entry.file_id, entry.type_id)
+            for entry in self.entries if entry.type_id == type_id
+        ]
 
     def stage(self, entry: ArchiveEntry) -> None:
-        if (entry.file_id, entry.type_id) not in self._by_key:
-            raise ArchiveError("Only resources from this archive may be staged.")
         self.staged_entries[(entry.file_id, entry.type_id)] = entry
 
     def particle_assets(self, effect: ParticleEffect) -> list[AssetLink]:
@@ -245,11 +380,11 @@ class ArchiveReader:
                 links.append(AssetLink(
                     "material", visualizer.material_id,
                     f"System {system.index + 1}: {visualizer.type_name}",
-                    self.get_entry(visualizer.material_id, MATERIAL_TYPE_ID) is not None,
+                    self.find_entry(visualizer.material_id, MATERIAL_TYPE_ID) is not None,
                     system.index,
                 ))
             if visualizer.unit_id is not None:
-                unit_entry = self.get_entry(visualizer.unit_id, UNIT_TYPE_ID)
+                unit_entry = self.find_entry(visualizer.unit_id, UNIT_TYPE_ID)
                 links.append(AssetLink(
                     "unit", visualizer.unit_id,
                     f"System {system.index + 1}: mesh visualizer unit",
@@ -269,13 +404,13 @@ class ArchiveReader:
                     links.append(AssetLink(
                         "material", material_id,
                         f"System {system.index + 1}: mesh unit material",
-                        self.get_entry(material_id, MATERIAL_TYPE_ID) is not None,
+                        self.find_entry(material_id, MATERIAL_TYPE_ID) is not None,
                         system.index,
                     ))
 
         texture_ids: set[int] = set()
         for material_id in material_ids:
-            material_entry = self.get_entry(material_id, MATERIAL_TYPE_ID)
+            material_entry = self.find_entry(material_id, MATERIAL_TYPE_ID)
             if material_entry is None:
                 continue
             material = parse_material(material_entry.toc_data)
@@ -296,8 +431,51 @@ class ArchiveReader:
                 ))
         return _unique_links(links)
 
+    def texture_bindings(self, effect: ParticleEffect) -> list[TextureBinding]:
+        bindings: list[TextureBinding] = []
+        for system_index, material_id in self.particle_material_ids(effect):
+            material_entry = self.find_entry(material_id, MATERIAL_TYPE_ID)
+            if material_entry is None:
+                continue
+            try:
+                material = parse_material(material_entry.toc_data)
+            except ArchiveError:
+                continue
+            for texture_id in material.texture_ids:
+                # Texture bytes are resolved only after selection, avoiding an archive scan
+                # for every visible texture while a particle is opened.
+                texture_entry = self.get_entry(texture_id, TEXTURE_TYPE_ID)
+                detail = f"Material {material_id}"
+                if texture_entry is not None:
+                    try:
+                        info = parse_texture(texture_entry)
+                        detail += f" | {info.width}x{info.height} | DXGI {info.dxgi_format}"
+                    except ArchiveError:
+                        detail += " | invalid texture header"
+                bindings.append(TextureBinding(
+                    system_index, material_id, texture_id, detail, texture_entry is not None
+                ))
+        return bindings
+
+    def particle_material_ids(self, effect: ParticleEffect) -> list[tuple[int, int]]:
+        """Return all material links used by each particle system in display order."""
+        links: list[tuple[int, int]] = []
+        for system in effect.particle_systems:
+            visualizer = system.visualizer
+            if visualizer is None:
+                continue
+            material_ids = []
+            if visualizer.material_id is not None:
+                material_ids.append(visualizer.material_id)
+            if visualizer.unit_id is not None:
+                unit = self.find_entry(visualizer.unit_id, UNIT_TYPE_ID)
+                if unit is not None:
+                    material_ids.extend(parse_unit_material_ids(unit.toc_data))
+            links.extend((system.index, material_id) for material_id in dict.fromkeys(material_ids))
+        return links
+
     def replace_texture_from_dds(self, texture_id: int, dds: bytes) -> ArchiveEntry:
-        entry = self.get_entry(texture_id, TEXTURE_TYPE_ID)
+        entry = self.find_entry(texture_id, TEXTURE_TYPE_ID)
         if entry is None:
             raise ArchiveError(f"Texture {texture_id} was not found in this archive.")
         info = parse_texture(entry)
@@ -316,7 +494,7 @@ class ArchiveReader:
         return staged
 
     def replace_texture_from_png(self, texture_id: int, png_path: str | Path) -> ArchiveEntry:
-        entry = self.get_entry(texture_id, TEXTURE_TYPE_ID)
+        entry = self.find_entry(texture_id, TEXTURE_TYPE_ID)
         if entry is None:
             raise ArchiveError(f"Texture {texture_id} was not found in this archive.")
         info = parse_texture(entry)
@@ -340,7 +518,11 @@ def parse_material(data: bytes) -> MaterialInfo:
     end = texture_offset + texture_count * 12
     if texture_count > 4096 or end > len(data):
         raise ArchiveError("Material texture table is outside the resource.")
-    texture_ids = tuple(_u64(data, texture_offset + index * 12 + 4) for index in range(texture_count))
+    texture_ids = tuple(
+        texture_id for texture_id in (
+            _u64(data, texture_offset + index * 12 + 4) for index in range(texture_count)
+        ) if texture_id not in (0, 0xFFFFFFFFFFFFFFFF)
+    )
     return MaterialInfo(parent_material_id, texture_ids)
 
 
@@ -377,7 +559,7 @@ def parse_unit_material_ids(data: bytes) -> tuple[int, ...]:
 def png_to_dds(png_path: Path, dxgi_format: int) -> bytes:
     if not png_path.is_file():
         raise ArchiveError(f"PNG file was not found: {png_path}")
-    executable = os.environ.get("PM_TEXCONV") or shutil.which("texconv") or shutil.which("texconv.exe")
+    executable = _texconv_executable()
     if not executable:
         raise ArchiveError(
             "PNG import needs DirectXTex texconv. Add texconv to PATH or set PM_TEXCONV."
@@ -393,6 +575,36 @@ def png_to_dds(png_path: Path, dxgi_format: int) -> bytes:
             message = result.stderr.strip() or result.stdout.strip() or "texconv did not create DDS output."
             raise ArchiveError(f"PNG conversion failed: {message}")
         return dds_path.read_bytes()
+
+
+def dds_to_png(dds: bytes, output_directory: str | Path, name: str) -> Path:
+    """Convert a DDS payload to a persistent PNG suitable for the QML viewer."""
+    if len(dds) < 148 or dds[:4] != b"DDS ":
+        raise ArchiveError("Texture preview requires a complete DDS texture.")
+    executable = _texconv_executable()
+    if not executable:
+        raise ArchiveError("Texture preview needs DirectXTex texconv. Add texconv to PATH or set PM_TEXCONV.")
+    output = Path(output_directory)
+    output.mkdir(parents=True, exist_ok=True)
+    source = output / f"{name}.dds"
+    png_path = output / f"{name}.png"
+    source.write_bytes(dds)
+    command = [
+        executable, "-y", "-o", str(output), "-ft", "png",
+        "-f", "R8G8B8A8_UNORM", "-sepalpha", "-alpha", "--", str(source),
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0 or not png_path.is_file():
+        message = result.stderr.strip() or result.stdout.strip() or "texconv did not create PNG output."
+        raise ArchiveError(f"Texture preview conversion failed: {message}")
+    return png_path
+
+
+def _texconv_executable() -> str | None:
+    bundled = Path(__file__).resolve().parents[1] / "tools" / "texconv.exe"
+    if bundled.is_file():
+        return str(bundled)
+    return os.environ.get("PM_TEXCONV") or shutil.which("texconv") or shutil.which("texconv.exe")
 
 
 def dxgi_format_name(value: int) -> str:
@@ -447,7 +659,9 @@ def write_patch_archive(path: Path, entries: list[ArchiveEntry]) -> None:
     _atomic_write(path.with_name(path.name + ".stream"), stream_data)
 
 
-def _parse_entries(toc_data: bytes, gpu_data: bytes, stream_data: bytes) -> list[ArchiveEntry]:
+def _parse_entries(
+    toc_data: bytes, gpu_data: bytes, stream_data: bytes, allow_missing_sidecars: bool = False,
+) -> list[ArchiveEntry]:
     if len(toc_data) < 72:
         raise ArchiveError("Archive TOC is too small.")
     magic, type_count, file_count, _unknown = struct.unpack_from("<IIII", toc_data, 0)
@@ -462,8 +676,10 @@ def _parse_entries(toc_data: bytes, gpu_data: bytes, stream_data: bytes) -> list
         fields = struct.unpack_from("<QQQQQQQIIIIII", toc_data, entry_offset + index * 80)
         file_id, type_id, toc_offset, stream_offset, gpu_offset, unknown1, unknown2, toc_size, stream_size, gpu_size, unknown3, unknown4, entry_index = fields
         _validate_span(toc_data, toc_offset, toc_size, "TOC resource")
-        _validate_span(gpu_data, gpu_offset, gpu_size, "GPU resource")
-        _validate_span(stream_data, stream_offset, stream_size, "stream resource")
+        if not allow_missing_sidecars or gpu_data:
+            _validate_span(gpu_data, gpu_offset, gpu_size, "GPU resource")
+        if not allow_missing_sidecars or stream_data:
+            _validate_span(stream_data, stream_offset, stream_size, "stream resource")
         entries.append(ArchiveEntry(
             file_id, type_id, toc_offset, stream_offset, gpu_offset, unknown1, unknown2,
             toc_size, stream_size, gpu_size, unknown3, unknown4, entry_index,
@@ -471,6 +687,22 @@ def _parse_entries(toc_data: bytes, gpu_data: bytes, stream_data: bytes) -> list
             stream_data[stream_offset:stream_offset + stream_size],
         ))
     return entries
+
+
+def _toc_contains_resource(toc_data: bytes, key: tuple[int, int]) -> bool:
+    if len(toc_data) < 72 or _u32(toc_data, 0) != ARCHIVE_MAGIC:
+        return False
+    type_count = _u32(toc_data, 4)
+    file_count = _u32(toc_data, 8)
+    entry_offset = 72 + type_count * 32
+    if entry_offset + file_count * 80 > len(toc_data):
+        return False
+    file_id, type_id = key
+    for index in range(file_count):
+        entry_file_id, entry_type_id = struct.unpack_from("<QQ", toc_data, entry_offset + index * 80)
+        if (entry_file_id, entry_type_id) == (file_id, type_id):
+            return True
+    return False
 
 
 def _read_package_data(path: Path) -> bytes:

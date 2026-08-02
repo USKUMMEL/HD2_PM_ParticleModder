@@ -11,7 +11,7 @@ from PySide6.QtCore import (
     Slot,
 )
 
-from pm_particle_modder.core import ArchiveEntry, AssetLink, ColorGraph, Graph, ParticleEffect, Visualizer
+from pm_particle_modder.core import ArchiveEntry, AssetLink, ColorGraph, Graph, ParticleEffect, TextureBinding, Visualizer
 
 
 class DocumentListModel(QAbstractListModel):
@@ -383,6 +383,61 @@ class AssetLinkListModel(QAbstractListModel):
 
     def link_at(self, row: int) -> AssetLink:
         return self.links[row]
+
+
+class TextureBindingListModel(QAbstractListModel):
+    SystemRole = Qt.ItemDataRole.UserRole + 1
+    MaterialRole = SystemRole + 1
+    TextureRole = MaterialRole + 1
+    DetailRole = TextureRole + 1
+    AvailableRole = DetailRole + 1
+
+    def __init__(self):
+        super().__init__()
+        self.bindings: list[TextureBinding] = []
+
+    def roleNames(self):
+        return {
+            self.SystemRole: QByteArray(b"systemLabel"),
+            self.MaterialRole: QByteArray(b"materialId"),
+            self.TextureRole: QByteArray(b"textureId"),
+            self.DetailRole: QByteArray(b"textureDetail"),
+            self.AvailableRole: QByteArray(b"textureAvailable"),
+        }
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.bindings)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or not 0 <= index.row() < len(self.bindings):
+            return None
+        binding = self.bindings[index.row()]
+        if role == self.SystemRole:
+            return f"Particle System {binding.system_index + 1}"
+        if role == self.MaterialRole:
+            return str(binding.material_id)
+        if role == self.TextureRole:
+            return str(binding.texture_id)
+        if role == self.DetailRole:
+            return binding.detail
+        if role == self.AvailableRole:
+            return binding.available
+        return None
+
+    def set_bindings(self, bindings: list[TextureBinding]) -> None:
+        self.beginResetModel()
+        self.bindings = list(bindings)
+        self.endResetModel()
+
+    def binding_at(self, row: int) -> TextureBinding:
+        return self.bindings[row]
+
+    def update_binding(self, row: int, binding: TextureBinding) -> None:
+        if not 0 <= row < len(self.bindings):
+            return
+        self.bindings[row] = binding
+        index = self.index(row, 0)
+        self.dataChanged.emit(index, index, list(self.roleNames()))
 
 
 def _color_hex(color: list[float]) -> str:

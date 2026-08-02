@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import math
 import os
@@ -9,7 +9,7 @@ import tempfile
 from urllib.request import urlopen
 import xml.etree.ElementTree as ET
 
-from PySide6.QtCore import Property, QObject, QUrl, Signal, Slot
+from PySide6.QtCore import Property, QObject, QRunnable, QThreadPool, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QUndoCommand, QUndoStack
 from PySide6.QtWidgets import (
     QApplication,
@@ -21,12 +21,15 @@ from PySide6.QtWidgets import (
 
 from pm_particle_modder.core import (
     PARTICLE_TYPE_ID,
+    TEXTURE_TYPE_ID,
     ArchiveError,
     ArchiveReader,
     ColorGraph,
+    dds_to_png,
     Graph,
     ParticleEffect,
     ParticleParseError,
+    parse_texture,
 )
 from pm_particle_modder.ui.models import (
     ArchiveParticleListModel,
@@ -34,6 +37,7 @@ from pm_particle_modder.ui.models import (
     DocumentListModel,
     FoundArchiveListModel,
     ParticleTableModel,
+    TextureBindingListModel,
     VisualizerListModel,
 )
 
@@ -87,6 +91,51 @@ class BulkEditCommand(QUndoCommand):
         self.refresh()
 
 
+class TexturePreviewSignals(QObject):
+    loaded = Signal(int, object, str, str)
+
+
+class TexturePreviewTask(QRunnable):
+    """Resolve and convert one texture without blocking the QML event loop."""
+
+    def __init__(self, request_id: int, archive: ArchiveReader, binding):
+        super().__init__()
+        self.request_id = request_id
+        self.archive = archive
+        self.binding = binding
+        self.signals = TexturePreviewSignals()
+
+    def run(self) -> None:
+        preview_url = ""
+        result = self.binding
+        try:
+            entry = self.archive.find_entry(self.binding.texture_id, TEXTURE_TYPE_ID)
+            if entry is None:
+                message = "Texture was not found in the available Slim archives."
+            else:
+                info = parse_texture(entry)
+                result = replace(
+                    self.binding,
+                    detail=f"{info.width} x {info.height} | DXGI {info.dxgi_format}",
+                    available=True,
+                )
+                cache_directory = Path(tempfile.gettempdir()) / "pm-particlemodder" / "texture-previews"
+                preview = dds_to_png(info.dds, cache_directory, str(self.binding.texture_id))
+                preview_url = QUrl.fromLocalFile(str(preview)).toString()
+                self.signals.loaded.emit(
+                    self.request_id,
+                    replace(result, preview_url=preview_url, preview_state="ready"),
+                    preview_url,
+                    result.detail,
+                )
+                return
+        except ArchiveError as error:
+            message = str(error)
+        self.signals.loaded.emit(
+            self.request_id, replace(result, preview_state="failed"), preview_url, message
+        )
+
+
 class ParticleController(QObject):
     stateChanged = Signal()
     currentDocumentChanged = Signal()
@@ -105,11 +154,28 @@ class ParticleController(QObject):
         self.archive_particles_model = ArchiveParticleListModel()
         self.found_archives_model = FoundArchiveListModel()
         self.asset_links_model = AssetLinkListModel()
+        self.texture_bindings_model = TextureBindingListModel()
         self._current_index = -1
         self._archive: ArchiveReader | None = None
         self._game_data_directory: Path | None = None
         self._archive_names: dict[str, str] | None = None
         self._selected_asset_index = -1
+        self._selected_texture_index = -1
+        self._all_texture_bindings = []
+        self._texture_system_indices: list[int] = []
+        self._texture_material_ids: list[int] = []
+        self._texture_materials_by_system: dict[int, list[int]] = {}
+        self._selected_texture_system = -1
+        self._selected_texture_material = -1
+        self._texture_list_view = False
+        self._texture_preview_url = ""
+        self._texture_preview_message = "Select a texture to preview it."
+        self._texture_preview_request = 0
+        self._texture_preview_pool = QThreadPool(self)
+        self._texture_preview_pool.setMaxThreadCount(1)
+        self._texture_overview_request = 0
+        self._texture_overview_pool = QThreadPool(self)
+        self._texture_overview_pool.setMaxThreadCount(1)
         self._status = "Ready"
 
     @Property(int, notify=currentDocumentChanged)
@@ -147,6 +213,76 @@ class ParticleController(QObject):
     @Property(int, notify=stateChanged)
     def assetCount(self) -> int:
         return self.asset_links_model.rowCount()
+
+    @Property(int, notify=stateChanged)
+    def textureCount(self) -> int:
+        return self.texture_bindings_model.rowCount()
+
+    @Property("QVariantList", notify=stateChanged)
+    def textureSystemOptions(self):
+        return [f"Particle System {index + 1}" for index in self._texture_system_indices]
+
+    @Property("QVariantList", notify=stateChanged)
+    def textureMaterialOptions(self):
+        return [str(material_id) for material_id in self._texture_material_ids]
+
+    @Property(bool, notify=stateChanged)
+    def hasTextureMaterialChoice(self) -> bool:
+        return len(self._texture_material_ids) > 1
+
+    @Property(bool, notify=stateChanged)
+    def textureListView(self) -> bool:
+        return self._texture_list_view
+
+    @Property("QVariantList", notify=stateChanged)
+    def textureOverviewRows(self):
+        rows = []
+        for system_index in self._texture_system_indices:
+            textures = [
+                {
+                    "systemIndex": binding.system_index,
+                    "materialId": str(binding.material_id),
+                    "textureId": str(binding.texture_id),
+                    "detail": binding.detail,
+                    "available": binding.available,
+                    "previewUrl": binding.preview_url,
+                    "previewState": binding.preview_state,
+                }
+                for binding in self._all_texture_bindings
+                if binding.system_index == system_index
+            ]
+            if textures:
+                rows.append({"systemIndex": system_index, "textures": textures})
+        return rows
+
+    @Property(str, notify=stateChanged)
+    def texturePreviewUrl(self) -> str:
+        return self._texture_preview_url
+
+    @Property(str, notify=stateChanged)
+    def texturePreviewMessage(self) -> str:
+        return self._texture_preview_message
+
+    @Property(bool, notify=stateChanged)
+    def hasSelectedTexture(self) -> bool:
+        if not 0 <= self._selected_texture_index < self.texture_bindings_model.rowCount():
+            return False
+        return self.texture_bindings_model.binding_at(self._selected_texture_index).available
+
+    @Property(int, notify=stateChanged)
+    def selectedTextureSystemIndex(self) -> int:
+        binding = self._selected_texture_binding()
+        return binding.system_index if binding is not None else -1
+
+    @Property(str, notify=stateChanged)
+    def selectedTextureMaterialId(self) -> str:
+        binding = self._selected_texture_binding()
+        return str(binding.material_id) if binding is not None else ""
+
+    @Property(str, notify=stateChanged)
+    def selectedTextureId(self) -> str:
+        binding = self._selected_texture_binding()
+        return str(binding.texture_id) if binding is not None else ""
 
     @Property(int, notify=stateChanged)
     def stagedChangeCount(self) -> int:
@@ -332,7 +468,17 @@ class ParticleController(QObject):
         self._archive = archive
         self.archive_particles_model.set_entries(archive.entries_of_type(PARTICLE_TYPE_ID))
         self.asset_links_model.set_links([])
+        self._all_texture_bindings = []
+        self.texture_bindings_model.set_bindings([])
         self._selected_asset_index = -1
+        self._selected_texture_index = -1
+        self._texture_system_indices = []
+        self._texture_material_ids = []
+        self._texture_materials_by_system = {}
+        self._selected_texture_system = -1
+        self._selected_texture_material = -1
+        self._texture_preview_url = ""
+        self._texture_preview_message = "Open an archive particle to preview textures."
         self.stateChanged.emit()
 
     @Slot(int)
@@ -598,36 +744,111 @@ class ParticleController(QObject):
             return False
 
     @Slot(int)
-    def selectAsset(self, row: int) -> None:
-        self._selected_asset_index = row if 0 <= row < self.asset_links_model.rowCount() else -1
+    def selectTexture(self, row: int) -> None:
+        self._selected_texture_index = row if 0 <= row < self.texture_bindings_model.rowCount() else -1
+        self._texture_preview_url = ""
+        self._texture_preview_request += 1
+        request_id = self._texture_preview_request
+        if self._selected_texture_index < 0:
+            self._texture_preview_message = "Select a texture to preview it."
+            self.stateChanged.emit()
+            return
+        binding = self.texture_bindings_model.binding_at(self._selected_texture_index)
+        document = self.current_document
+        archive = document.archive if document is not None else None
+        if archive is None:
+            self._texture_preview_message = "This particle is not backed by an archive."
+            self.stateChanged.emit()
+            return
+        self._texture_preview_message = "Loading texture..."
+        self._texture_preview_pool.clear()
+        task = TexturePreviewTask(request_id, archive, binding)
+        task.signals.loaded.connect(self._finish_texture_preview)
+        self._texture_preview_pool.start(task)
+        self.stateChanged.emit()
+
+    @Slot(int, object, str, str)
+    def _finish_texture_preview(self, request_id: int, binding, preview_url: str, message: str) -> None:
+        if request_id != self._texture_preview_request:
+            return
+        if binding.available:
+            self._update_texture_binding(binding)
+        self._texture_preview_url = preview_url
+        self._texture_preview_message = message
+        self.stateChanged.emit()
+
+    @Slot(int)
+    def selectTextureSystem(self, option_index: int) -> None:
+        if not 0 <= option_index < len(self._texture_system_indices):
+            return
+        self._selected_texture_system = self._texture_system_indices[option_index]
+        self._texture_material_ids = self._texture_materials_by_system.get(
+            self._selected_texture_system, []
+        )
+        self._selected_texture_material = self._texture_material_ids[0] if self._texture_material_ids else -1
+        self._apply_texture_filter()
+
+    @Slot(int)
+    def selectTextureMaterial(self, option_index: int) -> None:
+        if not 0 <= option_index < len(self._texture_material_ids):
+            return
+        self._selected_texture_material = self._texture_material_ids[option_index]
+        self._apply_texture_filter()
+
+    @Slot(bool)
+    def setTextureListView(self, enabled: bool) -> None:
+        if self._texture_list_view == enabled:
+            return
+        self._texture_list_view = enabled
+        self._texture_overview_request += 1
+        self._texture_overview_pool.clear()
+        self._apply_texture_filter()
+        if enabled:
+            self._queue_texture_overview_previews()
+
+    @Slot(int, str, str)
+    def selectTextureBinding(self, system_index: int, material_id: str, texture_id: str) -> None:
+        material_value = int(material_id)
+        texture_value = int(texture_id)
+        for row in range(self.texture_bindings_model.rowCount()):
+            binding = self.texture_bindings_model.binding_at(row)
+            if (binding.system_index, binding.material_id, binding.texture_id) == (
+                system_index, material_value, texture_value,
+            ):
+                self.selectTexture(row)
+                return
 
     @Slot()
     def importSelectedTexturePng(self) -> None:
-        link = self._selected_texture_link()
-        if link is None or self._archive is None:
+        texture_id = self._selected_texture_id()
+        document = self.current_document
+        archive = document.archive if document is not None else None
+        if texture_id is None or archive is None:
             return
         path, _ = QFileDialog.getOpenFileName(None, "Replace texture from PNG", "", "PNG (*.png)")
         if not path:
             return
         try:
-            self._archive.replace_texture_from_png(link.file_id, Path(path))
+            archive.replace_texture_from_png(texture_id, Path(path))
             self._refresh_assets()
-            self._set_status(f"Staged PNG replacement for texture {link.file_id}")
+            self._set_status(f"Staged PNG replacement for texture {texture_id}")
         except ArchiveError as error:
             self._show_error("Unable to import PNG texture", str(error))
 
     @Slot()
     def importSelectedTextureDds(self) -> None:
-        link = self._selected_texture_link()
-        if link is None or self._archive is None:
+        texture_id = self._selected_texture_id()
+        document = self.current_document
+        archive = document.archive if document is not None else None
+        if texture_id is None or archive is None:
             return
         path, _ = QFileDialog.getOpenFileName(None, "Replace texture from DDS", "", "DDS (*.dds)")
         if not path:
             return
         try:
-            self._archive.replace_texture_from_dds(link.file_id, Path(path).read_bytes())
+            archive.replace_texture_from_dds(texture_id, Path(path).read_bytes())
             self._refresh_assets()
-            self._set_status(f"Staged DDS replacement for texture {link.file_id}")
+            self._set_status(f"Staged DDS replacement for texture {texture_id}")
         except (OSError, ArchiveError) as error:
             self._show_error("Unable to import DDS texture", str(error))
 
@@ -645,20 +866,108 @@ class ParticleController(QObject):
         except (OSError, ArchiveError) as error:
             self._show_error("Unable to write patch", str(error))
 
-    def _selected_texture_link(self):
-        if not 0 <= self._selected_asset_index < self.asset_links_model.rowCount():
+    def _selected_texture_id(self):
+        binding = self._selected_texture_binding()
+        if binding is None:
             return None
-        link = self.asset_links_model.link_at(self._selected_asset_index)
-        return link if link.kind == "texture" and link.available else None
+        return binding.texture_id if binding.available else None
+
+    def _selected_texture_binding(self):
+        if not 0 <= self._selected_texture_index < self.texture_bindings_model.rowCount():
+            return None
+        return self.texture_bindings_model.binding_at(self._selected_texture_index)
 
     def _refresh_assets(self) -> None:
         document = self.current_document
         if document is not None and document.archive is not None:
             self.asset_links_model.set_links(document.archive.particle_assets(document.effect))
+            self._all_texture_bindings = document.archive.texture_bindings(document.effect)
+            self._texture_materials_by_system = {}
+            textured_materials = {
+                (binding.system_index, binding.material_id)
+                for binding in self._all_texture_bindings
+            }
+            for system_index, material_id in document.archive.particle_material_ids(document.effect):
+                if (system_index, material_id) in textured_materials:
+                    self._texture_materials_by_system.setdefault(system_index, []).append(material_id)
+            self._texture_system_indices = list(self._texture_materials_by_system)
+            self._selected_texture_system = self._texture_system_indices[0] if self._texture_system_indices else -1
+            self._texture_material_ids = self._texture_materials_by_system.get(
+                self._selected_texture_system, []
+            )
+            self._selected_texture_material = self._texture_material_ids[0] if self._texture_material_ids else -1
         else:
             self.asset_links_model.set_links([])
+            self._all_texture_bindings = []
+            self._texture_system_indices = []
+            self._texture_material_ids = []
+            self._texture_materials_by_system = {}
+            self._selected_texture_system = -1
+            self._selected_texture_material = -1
         self._selected_asset_index = -1
+        self._apply_texture_filter(emit_state=False)
         self.stateChanged.emit()
+        if self._texture_list_view:
+            self._queue_texture_overview_previews()
+
+    def _queue_texture_overview_previews(self) -> None:
+        self._texture_overview_request += 1
+        request_id = self._texture_overview_request
+        self._texture_overview_pool.clear()
+        document = self.current_document
+        archive = document.archive if document is not None else None
+        if archive is None:
+            return
+        pending = [
+            replace(binding, preview_state="loading")
+            if binding.preview_state != "ready" else binding
+            for binding in self._all_texture_bindings
+        ]
+        self._all_texture_bindings = pending
+        self.texture_bindings_model.set_bindings(pending)
+        for binding in pending:
+            if binding.preview_state != "loading":
+                continue
+            task = TexturePreviewTask(request_id, archive, binding)
+            task.signals.loaded.connect(self._finish_texture_overview_preview)
+            self._texture_overview_pool.start(task)
+        self.stateChanged.emit()
+
+    @Slot(int, object, str, str)
+    def _finish_texture_overview_preview(self, request_id: int, binding, _preview_url: str, _message: str) -> None:
+        if request_id != self._texture_overview_request or not self._texture_list_view:
+            return
+        self._update_texture_binding(binding)
+        self.stateChanged.emit()
+
+    def _update_texture_binding(self, binding) -> None:
+        self._all_texture_bindings = [
+            binding if (item.system_index, item.material_id, item.texture_id) ==
+            (binding.system_index, binding.material_id, binding.texture_id) else item
+            for item in self._all_texture_bindings
+        ]
+        for row in range(self.texture_bindings_model.rowCount()):
+            item = self.texture_bindings_model.binding_at(row)
+            if (item.system_index, item.material_id, item.texture_id) == (
+                binding.system_index, binding.material_id, binding.texture_id,
+            ):
+                self.texture_bindings_model.update_binding(row, binding)
+                break
+
+    def _apply_texture_filter(self, emit_state: bool = True) -> None:
+        self._texture_preview_request += 1
+        self.texture_bindings_model.set_bindings([
+            binding for binding in self._all_texture_bindings
+            if self._texture_list_view or (
+                binding.system_index == self._selected_texture_system
+                and binding.material_id == self._selected_texture_material
+            )
+        ])
+        self._selected_texture_index = -1
+        self._texture_preview_url = ""
+        self._texture_preview_message = "Select a texture to preview it."
+        if emit_state:
+            self.stateChanged.emit()
 
     @Slot(int)
     def setCurrentDocument(self, index: int) -> None:

@@ -73,9 +73,9 @@ def make_dsar_resources(resources: list[bytes]) -> bytes:
 
 class ArchiveTests(unittest.TestCase):
     def test_material_and_unit_reference_parsers(self):
-        material = bytearray(148)
+        material = bytearray(160)
         struct.pack_into("<Q", material, 24, 77)
-        struct.pack_into("<I", material, 64, 1)
+        struct.pack_into("<I", material, 64, 2)
         struct.pack_into("<IQ", material, 136, 2, TEXTURE_ID)
         info = parse_material(bytes(material))
         self.assertEqual(info.parent_material_id, 77)
@@ -108,6 +108,14 @@ class ArchiveTests(unittest.TestCase):
             links = archive.particle_assets(ParticleEffect.from_bytes(particle.toc_data))
             self.assertEqual([(link.kind, link.file_id) for link in links], [
                 ("material", MATERIAL_ID), ("texture", TEXTURE_ID),
+            ])
+            bindings = archive.texture_bindings(ParticleEffect.from_bytes(particle.toc_data))
+            self.assertEqual(
+                archive.particle_material_ids(ParticleEffect.from_bytes(particle.toc_data)),
+                [(0, MATERIAL_ID)],
+            )
+            self.assertEqual([(binding.system_index, binding.material_id, binding.texture_id) for binding in bindings], [
+                (0, MATERIAL_ID, TEXTURE_ID),
             ])
             self.assertEqual(parse_texture(archive.get_entry(TEXTURE_ID, TEXTURE_TYPE_ID)).dds, dds)
 
@@ -143,6 +151,83 @@ class ArchiveTests(unittest.TestCase):
 
             archive = SlimArchiveStore(directory_path).open_archive(archive_id)
             self.assertIsNotNone(archive.get_entry(PARTICLE_ID, PARTICLE_TYPE_ID))
+
+    def test_slim_store_resolves_texture_from_another_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            particle_archive_id = "0123456789abcdef"
+            texture_archive_id = "fedcba9876543210"
+            particle_path = directory_path / "particle_source"
+            texture_path = directory_path / "texture_source"
+            write_patch_archive(particle_path, [entry(PARTICLE_ID, PARTICLE_TYPE_ID, make_particle())])
+
+            material = bytearray(148)
+            struct.pack_into("<I", material, 64, 1)
+            struct.pack_into("<IQ", material, 136, 0, TEXTURE_ID)
+            dds = make_dds(b"external texture")
+            write_patch_archive(texture_path, [
+                entry(MATERIAL_ID, MATERIAL_TYPE_ID, bytes(material)),
+                entry(TEXTURE_ID, TEXTURE_TYPE_ID, bytes(192) + dds[:148]),
+            ])
+            particle_data = particle_path.read_bytes()
+            texture_data = texture_path.read_bytes()
+            (directory_path / "bundles.00.nxa").write_bytes(
+                make_dsar_resources([particle_data, texture_data[:100], texture_data[100:]])
+            )
+
+            mapping = bytearray(256)
+            struct.pack_into("<II", mapping, 12, 2, 2)
+            struct.pack_into("<QIII", mapping, 24, len(particle_data), 80, 1, 144)
+            struct.pack_into("<QIII", mapping, 48, len(texture_data), 112, 1, 160)
+            mapping[80:97] = particle_archive_id.encode() + b"\0"
+            mapping[112:129] = texture_archive_id.encode() + b"\0"
+            struct.pack_into("<QI", mapping, 144, 0, 0)
+            mapping[159] = 0
+            struct.pack_into("<QI", mapping, 160, 0, len(particle_data))
+            mapping[175] = 0
+            (directory_path / "bundles.nxa").write_bytes(make_dsar(bytes(mapping)))
+
+            archive = SlimArchiveStore(directory_path).open_archive(particle_archive_id)
+            particle = archive.get_entry(PARTICLE_ID, PARTICLE_TYPE_ID)
+            self.assertIsNotNone(particle)
+            bindings = archive.texture_bindings(ParticleEffect.from_bytes(particle.toc_data))
+            self.assertEqual([(binding.material_id, binding.texture_id, binding.available) for binding in bindings], [
+                (MATERIAL_ID, TEXTURE_ID, False),
+            ])
+            external = archive.find_entry(TEXTURE_ID, TEXTURE_TYPE_ID)
+            self.assertIsNotNone(external)
+            self.assertEqual((parse_texture(external).width, parse_texture(external).height), (16, 8))
+
+    def test_slim_store_loads_texture_sidecar_on_demand(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            archive_id = "0123456789abcdef"
+            source_path = directory_path / "source"
+            dds = make_dds(b"lazy gpu payload")
+            write_patch_archive(source_path, [
+                entry(TEXTURE_ID, TEXTURE_TYPE_ID, bytes(192) + dds[:148], dds[148:]),
+            ])
+            toc_data = source_path.read_bytes()
+            gpu_data = source_path.with_name(source_path.name + ".gpu_resources").read_bytes()
+            (directory_path / "bundles.00.nxa").write_bytes(make_dsar_resources([toc_data, gpu_data]))
+
+            mapping = bytearray(256)
+            struct.pack_into("<II", mapping, 12, 1, 2)
+            struct.pack_into("<QIII", mapping, 24, len(toc_data), 80, 1, 144)
+            struct.pack_into("<QIII", mapping, 48, len(gpu_data), 112, 1, 160)
+            mapping[80:97] = archive_id.encode() + b"\0"
+            mapping[112:143] = (archive_id + ".gpu_resources").encode() + b"\0"
+            struct.pack_into("<QI", mapping, 144, 0, 0)
+            mapping[159] = 0
+            struct.pack_into("<QI", mapping, 160, 0, len(toc_data))
+            mapping[175] = 0
+            (directory_path / "bundles.nxa").write_bytes(make_dsar(bytes(mapping)))
+
+            archive = SlimArchiveStore(directory_path).open_archive(archive_id)
+            self.assertEqual(archive.gpu_data, b"")
+            texture = archive.get_entry(TEXTURE_ID, TEXTURE_TYPE_ID)
+            self.assertIsNotNone(texture)
+            self.assertEqual(parse_texture(texture).dds, dds)
 
 
 if __name__ == "__main__":

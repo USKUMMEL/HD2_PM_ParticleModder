@@ -10,7 +10,7 @@ from PySide6.QtGui import QUndoStack
 from PySide6.QtWidgets import QApplication
 
 from pm_particle_modder.application.controller import Document, ParticleController
-from pm_particle_modder.core import ParticleEffect
+from pm_particle_modder.core import ParticleEffect, TextureBinding
 from test_particle import make_particle
 
 
@@ -74,6 +74,20 @@ class ControllerTests(unittest.TestCase):
         self.controller.saveColorPreset(0, selection)
         self.assertEqual(self.controller.selectionFor("color"), selection)
         self.assertEqual(self.controller.colorPreset(0), selection)
+
+    def test_texture_overview_uses_strings_for_64_bit_ids(self):
+        material_id = 16915718763308572383
+        texture_id = 14790446551990181426
+        self.controller._texture_system_indices = [0]
+        self.controller._texture_materials_by_system = {0: [material_id]}
+        self.controller._all_texture_bindings = [
+            TextureBinding(0, material_id, texture_id, "fixture", False)
+        ]
+
+        row = self.controller.textureOverviewRows[0]
+        texture = row["textures"][0]
+        self.assertEqual(texture["materialId"], str(material_id))
+        self.assertEqual(texture["textureId"], str(texture_id))
 
     def test_groups_sort_files_and_preserve_current_document(self):
         second = Document(
