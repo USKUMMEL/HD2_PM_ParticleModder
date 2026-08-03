@@ -514,13 +514,57 @@ class ParticleController(QObject):
         self._set_status(f"Game data folder set: {data_directory}")
         self.stateChanged.emit()
 
-    @Slot(str)
-    def loadArchive(self, value: str) -> None:
-        archive_id = value.strip().lower().removeprefix("0x")
+    @Slot(str, bool)
+    def loadArchive(self, value: str, load_all_particle_archives: bool = False) -> None:
+        raw_value = value.strip()
+        archive_id = raw_value.lower().removeprefix("0x")
+        if raw_value.isdecimal() and len(raw_value) != 16:
+            self._load_particle_by_id(int(raw_value), load_all_particle_archives)
+            return
         if len(archive_id) != 16 or any(character not in "0123456789abcdef" for character in archive_id):
             self.searchFoundArchives(value)
             return
         self._load_slim_archive(archive_id, self._load_archive_names().get(archive_id))
+
+    def _load_particle_by_id(self, particle_id: int, load_all: bool) -> None:
+        if self._game_data_directory is None:
+            self.selectGameDataDirectory()
+            if self._game_data_directory is None:
+                return
+        try:
+            if (
+                self._slim_store is None
+                or self._slim_store.data_directory != self._game_data_directory
+            ):
+                self._slim_store = SlimArchiveStore(self._game_data_directory)
+            archive_ids = self._slim_store.resource_archive_ids(particle_id, PARTICLE_TYPE_ID)
+        except (OSError, ArchiveError) as error:
+            self._show_error("Unable to find particle", str(error))
+            return
+        if not archive_ids:
+            self._show_error("Particle not found", f"No Slim archive contains particle {particle_id}.")
+            return
+        selected_ids = archive_ids if load_all else archive_ids[:1]
+        names = self._load_archive_names()
+        opened = 0
+        last_document = None
+        for archive_id in selected_ids:
+            try:
+                archive = self._open_slim_archive(archive_id)
+                entry = archive.get_entry(particle_id, PARTICLE_TYPE_ID)
+            except ArchiveError:
+                continue
+            if entry is None:
+                continue
+            self._activate_archive(archive)
+            group = f"Archive: {names.get(archive_id, archive_id)}"
+            document = self._open_archive_particle_from(archive, entry, group, select=False)
+            if document is not None:
+                opened += 1
+                last_document = document
+        if last_document is not None:
+            self._sort_documents(last_document)
+        self._set_status(f"Loaded particle {particle_id} from {opened} archive(s)")
 
     @Slot(str)
     def searchFoundArchives(self, query: str) -> None:

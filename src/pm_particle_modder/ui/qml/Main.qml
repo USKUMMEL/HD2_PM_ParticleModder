@@ -1501,12 +1501,22 @@ ApplicationWindow {
                                     PmTextField {
                                         id: archiveInput
                                         Layout.fillWidth: true
-                                        placeholderText: "Archive ID or found archive name"
+                                        placeholderText: "Archive ID, particle ID, or found archive name"
                                         inputMethodHints: Qt.ImhNoPredictiveText
                                         onTextChanged: controller.searchFoundArchives(text)
-                                        onAccepted: controller.loadArchive(text)
+                                        onAccepted: controller.loadArchive(text, loadAllParticleArchives.checked)
                                     }
-                                    PmButton { text: "Load"; enabled: archiveInput.text.length > 0; onClicked: controller.loadArchive(archiveInput.text) }
+                                    PmButton { text: "Load"; enabled: archiveInput.text.length > 0; onClicked: controller.loadArchive(archiveInput.text, loadAllParticleArchives.checked) }
+                                }
+                                CheckBox {
+                                    id: loadAllParticleArchives
+                                    Layout.fillWidth: true
+                                    Layout.preferredHeight: 26
+                                    text: "Load all archives containing searched particle ID"
+                                    font.pixelSize: 11
+                                    indicator.width: 16
+                                    indicator.height: 16
+                                    checked: false
                                 }
                                 RowLayout {
                                     Layout.fillWidth: true

@@ -202,6 +202,17 @@ class SlimArchiveStore:
         self._resource_locations[key] = None
         return None
 
+    def resource_archive_ids(self, file_id: int, type_id: int) -> list[str]:
+        """Return every Slim package containing a resource without loading its payload."""
+        key = (file_id, type_id)
+        matches = [
+            package.name for package in self.packages.values()
+            if not package.name.endswith((".gpu_resources", ".stream"))
+            and self._package_contains(package, key)
+        ]
+        self._resource_locations[key] = matches[0] if matches else None
+        return matches
+
     def find_source_resource(self, file_id: int, type_id: int) -> ArchiveEntry | None:
         key = (file_id, type_id)
         location = self._resource_locations.get(key, ...)
