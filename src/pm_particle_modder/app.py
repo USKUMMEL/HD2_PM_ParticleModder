@@ -41,6 +41,7 @@ def main() -> int:
     context.setContextProperty("opacityModel", controller.opacity_model)
     context.setContextProperty("intensityModel", controller.intensity_model)
     context.setContextProperty("visualizerModel", controller.visualizer_model)
+    context.setContextProperty("materialVariableModel", controller.material_variable_model)
     context.setContextProperty("archiveParticlesModel", controller.archive_particles_model)
     context.setContextProperty("foundArchivesModel", controller.found_archives_model)
     context.setContextProperty("assetLinksModel", controller.asset_links_model)

@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from pm_particle_modder import __version__
 from pm_particle_modder.core import (
+    MATERIAL_TYPE_ID,
     PARTICLE_TYPE_ID,
     TEXTURE_TYPE_ID,
     UNIT_TYPE_ID,
@@ -35,7 +36,9 @@ from pm_particle_modder.core import (
     ParticleEffect,
     ParticleParseError,
     parse_texture,
+    parse_material,
     preview_dds,
+    replace_material_variable,
     SlimArchiveStore,
     write_patch_archive,
 )
@@ -45,6 +48,7 @@ from pm_particle_modder.ui.models import (
     DocumentListModel,
     FoundArchiveListModel,
     ParticleTableModel,
+    MaterialVariableListModel,
     TextureBindingListModel,
     TextureOverviewListModel,
     VisualizerListModel,
@@ -192,6 +196,7 @@ class ParticleController(QObject):
         for model in (self.color_model, self.opacity_model, self.intensity_model):
             model.edit_handler = self.setTableCell
         self.visualizer_model = VisualizerListModel()
+        self.material_variable_model = MaterialVariableListModel()
         self.archive_particles_model = ArchiveParticleListModel()
         self.found_archives_model = FoundArchiveListModel()
         self.asset_links_model = AssetLinkListModel()
@@ -215,6 +220,10 @@ class ParticleController(QObject):
         self._all_texture_bindings = []
         self._texture_system_indices: list[int] = []
         self._texture_material_ids: list[int] = []
+        self._material_ids_by_system: dict[int, list[int]] = {}
+        self._material_system_indices: list[int] = []
+        self._selected_material_system = -1
+        self._selected_material_id = -1
         self._texture_materials_by_system: dict[int, list[int]] = {}
         self._selected_texture_system = -1
         self._selected_texture_material = -1
@@ -287,6 +296,26 @@ class ParticleController(QObject):
     @Property("QVariantList", notify=stateChanged)
     def textureMaterialOptions(self):
         return [str(material_id) for material_id in self._texture_material_ids]
+
+    @Property("QVariantList", notify=stateChanged)
+    def materialSystemOptions(self):
+        return [f"Particle System {index + 1}" for index in self._material_system_indices]
+
+    @Property("QVariantList", notify=stateChanged)
+    def materialOptions(self):
+        return [str(material_id) for material_id in self._material_ids_by_system.get(self._selected_material_system, [])]
+
+    @Property(bool, notify=stateChanged)
+    def hasMaterialChoice(self) -> bool:
+        return len(self._material_ids_by_system.get(self._selected_material_system, [])) > 1
+
+    @Property(int, notify=stateChanged)
+    def selectedMaterialSystemIndex(self) -> int:
+        return self._selected_material_system
+
+    @Property(str, notify=stateChanged)
+    def selectedMaterialId(self) -> str:
+        return str(self._selected_material_id) if self._selected_material_id >= 0 else ""
 
     @Property(bool, notify=stateChanged)
     def hasTextureMaterialChoice(self) -> bool:
@@ -1518,7 +1547,16 @@ class ParticleController(QObject):
                 (binding.system_index, binding.material_id)
                 for binding in self._all_texture_bindings
             }
-            for system_index, material_id in document.archive.particle_material_ids(document.effect):
+            particle_material_ids = document.archive.particle_material_ids(document.effect)
+            self._material_ids_by_system = {}
+            for system_index, material_id in particle_material_ids:
+                self._material_ids_by_system.setdefault(system_index, []).append(material_id)
+            self._material_system_indices = list(self._material_ids_by_system)
+            self._selected_material_system = self._material_system_indices[0] if self._material_system_indices else -1
+            selected_materials = self._material_ids_by_system.get(self._selected_material_system, [])
+            self._selected_material_id = selected_materials[0] if selected_materials else -1
+            self._refresh_material_variables()
+            for system_index, material_id in particle_material_ids:
                 if (system_index, material_id) in textured_materials:
                     self._texture_materials_by_system.setdefault(system_index, []).append(material_id)
             self._texture_system_indices = list(self._texture_materials_by_system)
@@ -1536,6 +1574,11 @@ class ParticleController(QObject):
             self._texture_system_indices = []
             self._texture_material_ids = []
             self._texture_materials_by_system = {}
+            self._material_ids_by_system = {}
+            self._material_system_indices = []
+            self._selected_material_system = -1
+            self._selected_material_id = -1
+            self.material_variable_model.set_variables([])
             self.texture_overview_model.set_bindings([], [])
             self._selected_texture_system = -1
             self._selected_texture_material = -1
@@ -1544,6 +1587,82 @@ class ParticleController(QObject):
         self.stateChanged.emit()
         if self._texture_list_view:
             self._queue_texture_overview_previews()
+
+    def _refresh_material_variables(self) -> None:
+        document = self.current_document
+        if document is None or document.archive is None or self._selected_material_id < 0:
+            self.material_variable_model.set_variables([])
+            return
+        try:
+            entry = document.archive.find_entry(self._selected_material_id, MATERIAL_TYPE_ID)
+            material = parse_material(entry.toc_data) if entry is not None else None
+        except ArchiveError:
+            material = None
+        self.material_variable_model.set_variables(material.shader_variables if material else [])
+
+    @Slot(int)
+    def selectMaterialSystem(self, option_index: int) -> None:
+        if not 0 <= option_index < len(self._material_system_indices):
+            return
+        self._selected_material_system = self._material_system_indices[option_index]
+        materials = self._material_ids_by_system.get(self._selected_material_system, [])
+        self._selected_material_id = materials[0] if materials else -1
+        self._refresh_material_variables()
+        self.stateChanged.emit()
+
+    @Slot(int)
+    def selectMaterial(self, option_index: int) -> None:
+        materials = self._material_ids_by_system.get(self._selected_material_system, [])
+        if not 0 <= option_index < len(materials):
+            return
+        self._selected_material_id = materials[option_index]
+        self._refresh_material_variables()
+        self.stateChanged.emit()
+
+    @Slot(int, int, str)
+    def setMaterialVariableValue(self, variable_index: int, value_index: int, text: str) -> None:
+        document = self.current_document
+        if document is None or document.archive is None or self._selected_material_id < 0:
+            return
+        try:
+            value = float(text)
+            if not math.isfinite(value):
+                raise ValueError
+            variable = self.material_variable_model.variables[variable_index]
+            entry = document.archive.find_entry(self._selected_material_id, MATERIAL_TYPE_ID)
+            if entry is None:
+                raise ArchiveError("Material resource was not found.")
+            document.archive.stage(replace_material_variable(entry, variable, value_index, value))
+        except (ValueError, IndexError, ArchiveError):
+            self._refresh_material_variables()
+            return
+        self._mark_selected_patch_for_write()
+        self._refresh_material_variables()
+        self._set_status(f"Staged material {self._selected_material_id}")
+
+    @Slot(int)
+    def pickMaterialVariableColor(self, variable_index: int) -> None:
+        document = self.current_document
+        if document is None or document.archive is None or self._selected_material_id < 0:
+            return
+        try:
+            variable = self.material_variable_model.variables[variable_index]
+            initial = QColor.fromRgbF(*variable.values[:3])
+            color = QColorDialog.getColor(initial, None, "Material shader color")
+            if not color.isValid():
+                return
+            entry = document.archive.find_entry(self._selected_material_id, MATERIAL_TYPE_ID)
+            if entry is None:
+                raise ArchiveError("Material resource was not found.")
+            for value_index, value in enumerate((color.redF(), color.greenF(), color.blueF())):
+                entry = replace_material_variable(entry, variable, value_index, value)
+            document.archive.stage(entry)
+        except (IndexError, ArchiveError):
+            self._refresh_material_variables()
+            return
+        self._mark_selected_patch_for_write()
+        self._refresh_material_variables()
+        self._set_status(f"Staged material {self._selected_material_id}")
 
     def _mesh_archive_locations(self, document: Document | None) -> dict[int, str]:
         if document is None or document.archive is None:

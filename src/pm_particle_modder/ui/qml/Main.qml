@@ -144,7 +144,7 @@ ApplicationWindow {
                 ToolTip.text: "File"
                 ToolTip.delay: 500
             }
-            PmButton { text: "Load Archive"; tooltip: "Load an archive by ID or found archive name"; onClicked: window.sectionIndex = 6 }
+            PmButton { text: "Load Archive"; tooltip: "Load an archive by ID or found archive name"; onClicked: window.sectionIndex = 7 }
             PmButton { text: "Create Patch"; tooltip: "Create a patch target"; onClicked: controller.createPatch() }
             Rectangle {
                 id: patchSelector
@@ -599,7 +599,7 @@ ApplicationWindow {
                         font.weight: Font.DemiBold
                     }
                     Repeater {
-                        model: ["Color", "Opacity", "Intensity", "Lifetime", "Visualizers", "Texture"]
+                        model: ["Color", "Opacity", "Intensity", "Lifetime", "Visualizers", "Texture", "Material Editor"]
                         delegate: Rectangle {
                             id: navItem
                             required property int index
@@ -791,8 +791,8 @@ ApplicationWindow {
                         objectName: "editorStack"
                         Layout.fillWidth: true
                         Layout.fillHeight: true
-                        currentIndex: controller.hasDocument || window.sectionIndex === 6
-                                      ? window.sectionIndex : 7
+                        currentIndex: controller.hasDocument || window.sectionIndex === 7
+                                      ? window.sectionIndex : 8
 
                         GraphTable {
                             objectName: "colorGraphTable"
@@ -1420,6 +1420,55 @@ ApplicationWindow {
                         }
 
                         Item {
+                            ColumnLayout {
+                                anchors.fill: parent; anchors.margins: 16; spacing: 10
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    Text { text: "MATERIAL EDITOR"; color: Theme.text; font.pixelSize: 15; font.weight: Font.DemiBold; Layout.fillWidth: true }
+                                    Text { text: controller.selectedMaterialId; color: Theme.textMuted; font.pixelSize: 11 }
+                                }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    ComboBox { Layout.fillWidth: true; model: controller.materialSystemOptions; enabled: model.length > 0; currentIndex: Math.max(0, controller.materialSystemOptions.indexOf("Particle System " + (controller.selectedMaterialSystemIndex + 1))); onActivated: controller.selectMaterialSystem(currentIndex) }
+                                    ComboBox { visible: controller.hasMaterialChoice; Layout.preferredWidth: 245; model: controller.materialOptions; currentIndex: Math.max(0, controller.materialOptions.indexOf(controller.selectedMaterialId)); onActivated: controller.selectMaterial(currentIndex) }
+                                }
+                                Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.border }
+                                ListView {
+                                    id: materialVariableList; Layout.fillWidth: true; Layout.fillHeight: true; clip: true; spacing: 4; model: materialVariableModel
+                                    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                                    delegate: Rectangle {
+                                        id: materialVariableDelegate
+                                        required property int index; required property string variableLabel; required property var variableValues; required property bool variableIsColor
+                                        width: materialVariableList.width - 10; height: 50; color: Theme.surface; border.width: 1; border.color: Theme.border; radius: 4
+                                        RowLayout {
+                                            anchors.fill: parent; anchors.margins: 8; spacing: 8
+                                            Text { Layout.preferredWidth: 230; text: variableLabel; color: Theme.textMuted; font.pixelSize: 11; elide: Text.ElideRight }
+                                            Repeater {
+                                                model: variableValues.length
+                                                delegate: PmTextField {
+                                                    required property int index
+                                                    Layout.preferredWidth: 110; text: Number(variableValues[index]).toString()
+                                                    validator: DoubleValidator { notation: DoubleValidator.StandardNotation }
+                                                    onEditingFinished: controller.setMaterialVariableValue(materialVariableDelegate.index, index, text)
+                                                }
+                                            }
+                                            Rectangle {
+                                                visible: variableIsColor; Layout.preferredWidth: 28; Layout.preferredHeight: 28
+                                                color: Qt.rgba(variableValues[0], variableValues[1], variableValues[2], 1)
+                                                border.width: 1; border.color: Theme.borderStrong; radius: 3
+                                                MouseArea { id: materialColorMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: controller.pickMaterialVariableColor(materialVariableDelegate.index) }
+                                                ToolTip.visible: materialColorMouse.containsMouse
+                                                ToolTip.text: "Pick Vector3 color"
+                                            }
+                                            Item { Layout.fillWidth: true }
+                                        }
+                                    }
+                                    Text { anchors.centerIn: parent; visible: materialVariableList.count === 0; text: controller.hasDocument ? "No material is linked to this particle" : "Open an archive particle to edit its materials"; color: Theme.textMuted; font.pixelSize: 12 }
+                                }
+                            }
+                        }
+
+                        Item {
                             id: assetPanel
                             property int selectedAssetIndex: -1
                             property bool selectedTexture: false
@@ -1576,7 +1625,7 @@ ApplicationWindow {
                                     spacing: 8
                                     PmButton {
                                         text: "Open Archive"
-                                        onClicked: window.sectionIndex = 6
+                                        onClicked: window.sectionIndex = 7
                                     }
                                     PmButton {
                                         text: "Open .particle"

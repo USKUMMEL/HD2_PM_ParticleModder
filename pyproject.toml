@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pm-particle-modder"
-version = "0.1.0"
+version = "0.1.1"
 description = "Personal particle modding tool for Helldivers 2"
 requires-python = ">=3.11"
 dependencies = ["PySide6>=6.10,<6.11", "lz4>=4.4,<5"]
@@ -19,7 +19,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-pm_particle_modder = ["ui/qml/*.qml", "ui/qml/qmldir", "ui/assets/*", "tools/*.exe"]
+pm_particle_modder = ["ui/qml/*.qml", "ui/qml/qmldir", "ui/assets/*", "tools/*.exe", "data/*.txt"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -20,10 +20,25 @@ PARTICLE_TYPE_ID = 12112766700566326628
 TEXTURE_TYPE_ID = 14790446551990181426
 MATERIAL_TYPE_ID = 16915718763308572383
 UNIT_TYPE_ID = 16187218042980615487
+_SHADER_VARIABLE_NAMES: dict[int, str] | None = None
 
 
 class ArchiveError(ValueError):
     """Raised when a Stingray archive cannot be read or written safely."""
+
+
+def shader_variable_name(variable_id: int) -> str:
+    global _SHADER_VARIABLE_NAMES
+    if _SHADER_VARIABLE_NAMES is None:
+        names: dict[int, str] = {}
+        try:
+            for line in (Path(__file__).parents[1] / "data" / "shadervariables.txt").read_text(encoding="utf-8").splitlines():
+                name, value = line.rsplit(maxsplit=1)
+                names[int(value, 16)] = name
+        except (OSError, ValueError):
+            pass
+        _SHADER_VARIABLE_NAMES = names
+    return _SHADER_VARIABLE_NAMES.get(variable_id, f"0x{variable_id:08X}")
 
 
 @dataclass(frozen=True)
@@ -61,6 +76,16 @@ class ArchiveEntry:
 class MaterialInfo:
     parent_material_id: int
     texture_ids: tuple[int, ...]
+    shader_variables: tuple["ShaderVariableInfo", ...]
+
+
+@dataclass(frozen=True)
+class ShaderVariableInfo:
+    klass: int
+    elements: int
+    variable_id: int
+    data_offset: int
+    values: tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -647,7 +672,32 @@ def parse_material(data: bytes) -> MaterialInfo:
             for index in range(texture_count)
         ) if texture_id not in (0, 0xFFFFFFFFFFFFFFFF)
     )
-    return MaterialInfo(parent_material_id, texture_ids)
+    variable_count = _u32(data, 104)
+    header_offset = end
+    values_offset = header_offset + variable_count * 20
+    if variable_count > 4096 or values_offset > len(data):
+        raise ArchiveError("Material shader variable table is outside the resource.")
+    shader_variables = []
+    for index in range(variable_count):
+        offset = header_offset + index * 20
+        klass, elements, variable_id, value_offset, _stride = struct.unpack_from("<IIIII", data, offset)
+        value_count = klass + 1
+        value_start = values_offset + value_offset
+        if klass not in (0, 1, 2, 3, 12) or value_start + value_count * 4 > len(data):
+            raise ArchiveError(f"Material shader variable {index} is unsupported or truncated.")
+        shader_variables.append(ShaderVariableInfo(
+            klass, elements, variable_id, value_start,
+            tuple(struct.unpack_from(f"<{value_count}f", data, value_start)),
+        ))
+    return MaterialInfo(parent_material_id, texture_ids, tuple(shader_variables))
+
+
+def replace_material_variable(entry: ArchiveEntry, variable: ShaderVariableInfo, value_index: int, value: float) -> ArchiveEntry:
+    if not 0 <= value_index < len(variable.values):
+        raise ArchiveError("Material shader variable value index is invalid.")
+    output = bytearray(entry.toc_data)
+    struct.pack_into("<f", output, variable.data_offset + value_index * 4, value)
+    return entry.with_data(bytes(output), entry.gpu_data, entry.stream_data)
 
 
 def parse_texture(entry: ArchiveEntry) -> TextureInfo:

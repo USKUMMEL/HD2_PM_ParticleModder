@@ -11,7 +11,7 @@ from PySide6.QtCore import (
     Slot,
 )
 
-from pm_particle_modder.core import ArchiveEntry, AssetLink, ColorGraph, Graph, ParticleEffect, TextureBinding, Visualizer
+from pm_particle_modder.core import ArchiveEntry, AssetLink, ColorGraph, Graph, ParticleEffect, shader_variable_name, ShaderVariableInfo, TextureBinding, Visualizer
 
 
 class DocumentListModel(QAbstractListModel):
@@ -422,6 +422,59 @@ class AssetLinkListModel(QAbstractListModel):
 
     def link_at(self, row: int) -> AssetLink:
         return self.links[row]
+
+
+class MaterialVariableListModel(QAbstractListModel):
+    LabelRole = Qt.ItemDataRole.UserRole + 1
+    ValuesRole = LabelRole + 1
+    IsColorRole = ValuesRole + 1
+
+    def __init__(self):
+        super().__init__()
+        self.variables: list[ShaderVariableInfo] = []
+
+    def roleNames(self):
+        return {
+            self.LabelRole: QByteArray(b"variableLabel"),
+            self.ValuesRole: QByteArray(b"variableValues"),
+            self.IsColorRole: QByteArray(b"variableIsColor"),
+        }
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.variables)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or not 0 <= index.row() < len(self.variables):
+            return None
+        variable = self.variables[index.row()]
+        if role == self.LabelRole:
+            kind = {0: "Scalar", 1: "Vector2", 2: "Vector3", 3: "Vector4", 12: "Other"}[variable.klass]
+            return f"{kind}: {shader_variable_name(variable.variable_id)}"
+        if role == self.ValuesRole:
+            return list(variable.values)
+        if role == self.IsColorRole:
+            return variable.klass == 2
+        return None
+
+    def set_variables(self, variables: tuple[ShaderVariableInfo, ...] | list[ShaderVariableInfo]) -> None:
+        updated = list(variables)
+        same_structure = (
+            len(self.variables) == len(updated)
+            and all(
+                (old.klass, old.variable_id, len(old.values)) == (new.klass, new.variable_id, len(new.values))
+                for old, new in zip(self.variables, updated)
+            )
+        )
+        if same_structure:
+            self.variables = updated
+            if updated:
+                self.dataChanged.emit(
+                    self.index(0, 0), self.index(len(updated) - 1, 0), list(self.roleNames())
+                )
+            return
+        self.beginResetModel()
+        self.variables = updated
+        self.endResetModel()
 
 
 class TextureBindingListModel(QAbstractListModel):
