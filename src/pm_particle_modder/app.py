@@ -21,7 +21,9 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     package_dir = Path(__file__).resolve().parent
-    icon_path = package_dir / "ui" / "assets" / "icon.png"
+    icon_path = package_dir / "ui" / "assets" / "icon.ico"
+    if not icon_path.exists():
+        icon_path = package_dir / "ui" / "assets" / "icon.png"
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
 
@@ -38,6 +40,7 @@ def main() -> int:
     context.setContextProperty("foundArchivesModel", controller.found_archives_model)
     context.setContextProperty("assetLinksModel", controller.asset_links_model)
     context.setContextProperty("textureBindingsModel", controller.texture_bindings_model)
+    context.setContextProperty("textureOverviewModel", controller.texture_overview_model)
 
     qml_path = package_dir / "ui" / "qml" / "Main.qml"
     engine.load(QUrl.fromLocalFile(str(qml_path)))

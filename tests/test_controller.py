@@ -3,15 +3,46 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtGui import QUndoStack
+from PySide6.QtGui import QColor, QUndoStack
 from PySide6.QtWidgets import QApplication
 
 from pm_particle_modder.application.controller import Document, ParticleController
-from pm_particle_modder.core import ParticleEffect, TextureBinding
+from pm_particle_modder.core import (
+    ArchiveEntry,
+    ArchiveReader,
+    PARTICLE_TYPE_ID,
+    TEXTURE_TYPE_ID,
+    ParticleEffect,
+    TextureBinding,
+    write_patch_archive,
+)
 from test_particle import make_particle
+
+
+def particle_archive_entry(file_id: int, data: bytes) -> ArchiveEntry:
+    return ArchiveEntry(
+        file_id=file_id,
+        type_id=PARTICLE_TYPE_ID,
+        toc_offset=0,
+        stream_offset=0,
+        gpu_offset=0,
+        unknown1=0,
+        unknown2=0,
+        toc_size=len(data),
+        stream_size=0,
+        gpu_size=0,
+        unknown3=16,
+        unknown4=64,
+        index=0,
+        toc_data=data,
+        gpu_data=b"",
+        stream_data=b"",
+    )
 
 
 class ControllerTests(unittest.TestCase):
@@ -75,19 +106,385 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.controller.selectionFor("color"), selection)
         self.assertEqual(self.controller.colorPreset(0), selection)
 
-    def test_texture_overview_uses_strings_for_64_bit_ids(self):
+    def test_texture_overview_model_uses_strings_for_64_bit_ids(self):
         material_id = 16915718763308572383
         texture_id = 14790446551990181426
-        self.controller._texture_system_indices = [0]
-        self.controller._texture_materials_by_system = {0: [material_id]}
-        self.controller._all_texture_bindings = [
-            TextureBinding(0, material_id, texture_id, "fixture", False)
-        ]
-
-        row = self.controller.textureOverviewRows[0]
-        texture = row["textures"][0]
+        self.controller.texture_overview_model.set_bindings(
+            [TextureBinding(0, material_id, texture_id, "fixture", False)], [0]
+        )
+        index = self.controller.texture_overview_model.index(0, 0)
+        texture = self.controller.texture_overview_model.data(
+            index, self.controller.texture_overview_model.TexturesRole
+        )[0]
         self.assertEqual(texture["materialId"], str(material_id))
         self.assertEqual(texture["textureId"], str(texture_id))
+
+    def test_selecting_texture_system_previews_its_first_texture(self):
+        binding = TextureBinding(3, 55, 77, "fixture", False)
+        self.controller._texture_system_indices = [3]
+        self.controller._texture_materials_by_system = {3: [55]}
+        self.controller._all_texture_bindings = [binding]
+
+        self.controller.selectTextureSystem(0)
+
+        self.assertEqual(self.controller._selected_texture_index, 0)
+
+    def test_switching_from_list_view_keeps_the_selected_texture(self):
+        first = TextureBinding(1, 11, 101, "first", False)
+        selected = TextureBinding(4, 55, 202, "selected", False)
+        self.controller._texture_system_indices = [1, 4]
+        self.controller._texture_materials_by_system = {1: [11], 4: [55]}
+        self.controller._all_texture_bindings = [first, selected]
+
+        self.controller.setTextureListView(True)
+        self.controller.selectTexture(1)
+        self.controller.setTextureListView(False)
+
+        self.assertEqual(self.controller.selectedTextureSystemIndex, 4)
+        self.assertEqual(self.controller.selectedTextureMaterialId, "55")
+        self.assertEqual(self.controller.selectedTextureId, "202")
+        self.assertEqual(self.controller.texture_bindings_model.rowCount(), 1)
+
+    def test_persists_game_data_folder_and_picker_colors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_folder = root / "data"
+            data_folder.mkdir()
+            (data_folder / "bundles.nxa").write_bytes(b"fixture")
+            settings_path = root / "preferences.json"
+            controller = ParticleController(settings_path=settings_path)
+            controller._game_data_directory = data_folder
+            controller._remember_custom_picker_color(QColor(12, 34, 56))
+
+            restored = ParticleController(settings_path=settings_path)
+
+            self.assertEqual(restored._game_data_directory, data_folder.resolve())
+            self.assertEqual(restored._custom_picker_colors, ["#0c2238"])
+
+    def test_project_reopens_slim_archive_particles_by_id(self):
+        archive_id = "2f1147605182c6ab"
+        particle_id = 17140666081042917137
+        archive = SimpleNamespace(
+            path=Path(archive_id),
+            _slim_store=object(),
+            particle_assets=lambda effect: [],
+            texture_bindings=lambda effect: [],
+            particle_material_ids=lambda effect: [],
+            get_entry=lambda file_id, type_id: (
+                SimpleNamespace(file_id=particle_id, toc_data=make_particle())
+                if (file_id, type_id) == (particle_id, PARTICLE_TYPE_ID)
+                else None
+            ),
+        )
+        document = Document(
+            Path(f"{archive_id} [{particle_id}].particles"),
+            ParticleEffect.from_bytes(make_particle()),
+            QUndoStack(),
+            archive=archive,
+            archive_entry_id=particle_id,
+            title=f"{particle_id}.particle",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_path = root / "archive-project.pmod"
+            self.controller.documents_model = type(self.controller.documents_model)()
+            self.controller.documents_model.append(document)
+            with patch(
+                "pm_particle_modder.application.controller.QFileDialog.getSaveFileName",
+                return_value=(str(project_path), "PM Projects (*.pmod)"),
+            ):
+                self.controller.saveProject()
+
+            saved = json.loads(project_path.read_text(encoding="utf-8"))
+            item = saved["structure"][0]
+            self.assertEqual(item["type"], "archive_particle")
+            self.assertEqual(item["archiveId"], archive_id)
+            self.assertEqual(item["entryId"], str(particle_id))
+
+            data_directory = root / "data"
+            data_directory.mkdir()
+            (data_directory / "bundles.nxa").write_bytes(b"fixture")
+            restored = ParticleController(settings_path=root / "preferences.json")
+            restored._game_data_directory = data_directory
+            with patch(
+                "pm_particle_modder.application.controller.ArchiveReader.open_slim",
+                return_value=archive,
+            ) as open_slim:
+                restored._open_project(project_path)
+
+            open_slim.assert_called_once_with(data_directory, archive_id)
+            self.assertEqual(restored.documents_model.rowCount(), 1)
+            self.assertEqual(restored.current_document.archive_entry_id, particle_id)
+
+    def test_project_reopens_legacy_slim_archive_paths(self):
+        archive_id = "2f1147605182c6ab"
+        particle_id = 9614626952868023871
+        archive = SimpleNamespace(
+            path=Path(archive_id),
+            _slim_store=object(),
+            particle_assets=lambda effect: [],
+            texture_bindings=lambda effect: [],
+            particle_material_ids=lambda effect: [],
+            get_entry=lambda file_id, type_id: (
+                SimpleNamespace(file_id=particle_id, toc_data=make_particle())
+                if (file_id, type_id) == (particle_id, PARTICLE_TYPE_ID)
+                else None
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_directory = root / "data"
+            data_directory.mkdir()
+            (data_directory / "bundles.nxa").write_bytes(b"fixture")
+            project_path = root / "legacy.pmod"
+            legacy_path = data_directory / f"{archive_id} [{particle_id}].particles"
+            project_path.write_text(json.dumps({
+                "version": 2,
+                "structure": [{"type": "file", "filepath": str(legacy_path)}],
+            }), encoding="utf-8")
+
+            controller = ParticleController(settings_path=root / "preferences.json")
+            controller._game_data_directory = data_directory
+            with patch(
+                "pm_particle_modder.application.controller.ArchiveReader.open_slim",
+                return_value=archive,
+            ):
+                controller._open_project(project_path)
+
+            self.assertEqual(controller.documents_model.rowCount(), 1)
+            self.assertEqual(controller.current_document.archive_entry_id, particle_id)
+
+    def test_archive_patch_toggle_and_reset_use_the_opened_source(self):
+        particle_id = 42
+        source = make_particle()
+        archive = SimpleNamespace(
+            path=Path("fixture_archive"),
+            _slim_store=None,
+            staged_entries={(particle_id, PARTICLE_TYPE_ID): object()},
+            particle_assets=lambda effect: [],
+            texture_bindings=lambda effect: [],
+            particle_material_ids=lambda effect: [],
+        )
+        document = Document(
+            Path("fixture_archive [42].particles"),
+            ParticleEffect.from_bytes(source),
+            QUndoStack(),
+            archive=archive,
+            archive_entry_id=particle_id,
+            source_data=source,
+        )
+        self.controller.documents_model.append(document)
+        self.controller.setCurrentDocument(1)
+        document.effect.min_lifetime = 9.0
+
+        self.controller.togglePatchInclude(1)
+        self.assertTrue(document.include_in_patch)
+        self.assertTrue(self.controller.canWritePatch)
+
+        self.controller.togglePatchInclude(1)
+        self.assertFalse(document.include_in_patch)
+        self.assertNotIn((particle_id, PARTICLE_TYPE_ID), archive.staged_entries)
+
+        self.controller.resetDocument(1)
+        self.assertEqual(document.effect.min_lifetime, ParticleEffect.from_bytes(source).min_lifetime)
+
+    def test_standalone_particle_can_be_included_in_a_patch(self):
+        particle_id = 17140666081042917137
+        source = make_particle()
+        document = Document(
+            Path(f"{particle_id}.particles"),
+            ParticleEffect.from_bytes(source),
+            QUndoStack(),
+            source_data=source,
+        )
+        controller = ParticleController()
+        controller.documents_model.append(document)
+        controller.setCurrentDocument(0)
+        controller.togglePatchInclude(0)
+
+        self.assertTrue(document.include_in_patch)
+        self.assertEqual(document.patch_entry_id, particle_id)
+
+        with tempfile.TemporaryDirectory() as directory:
+            archive_path = Path(directory) / "base_archive"
+            write_patch_archive(archive_path, [])
+            controller._archive = ArchiveReader.open(archive_path)
+            controller.createPatch()
+            patch_path = Path(directory) / "9ba626afa44a3aa3.patch_0"
+            self.assertEqual(controller.selectedPatchName, patch_path.name)
+            controller.writePatch()
+            entry = ArchiveReader.open(patch_path).get_entry(particle_id, PARTICLE_TYPE_ID)
+            self.assertIsNotNone(entry)
+            self.assertEqual(entry.toc_data, source)
+
+    def test_patch_only_writes_particles_with_the_shield_enabled(self):
+        first_id = 101
+        second_id = 202
+        source = make_particle()
+        with tempfile.TemporaryDirectory() as directory:
+            archive_path = Path(directory) / "source_archive"
+            write_patch_archive(
+                archive_path,
+                [particle_archive_entry(first_id, source), particle_archive_entry(second_id, source)],
+            )
+            archive = ArchiveReader.open(archive_path)
+            controller = ParticleController()
+            for particle_id in (first_id, second_id):
+                entry = archive.get_entry(particle_id, PARTICLE_TYPE_ID)
+                controller.documents_model.append(Document(
+                    Path(f"{particle_id}.particles"),
+                    ParticleEffect.from_bytes(entry.toc_data),
+                    QUndoStack(),
+                    archive=archive,
+                    archive_entry_id=particle_id,
+                    title=f"{particle_id}.particle",
+                    source_data=entry.toc_data,
+                ))
+            controller.setCurrentDocument(0)
+            controller.togglePatchInclude(0)
+            controller.createPatch()
+            controller.writePatch()
+
+            patch = ArchiveReader.open(Path(directory) / "9ba626afa44a3aa3.patch_0")
+            particle_ids = [entry.file_id for entry in patch.entries_of_type(PARTICLE_TYPE_ID)]
+            self.assertEqual(particle_ids, [first_id])
+
+    def test_patch_names_are_pm_sequence_and_ignore_existing_data_folder_patches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive_path = root / "source_archive"
+            write_patch_archive(archive_path, [])
+            (root / "9ba626afa44a3aa3.patch_0").write_bytes(b"existing patch")
+            controller = ParticleController()
+            controller._archive = ArchiveReader.open(archive_path)
+
+            controller.createPatch()
+            controller.createPatch()
+
+            self.assertEqual(controller.patchOptions, [
+                "9ba626afa44a3aa3.patch_0",
+                "9ba626afa44a3aa3.patch_1",
+            ])
+
+    def test_renamed_patch_uses_the_new_file_name_when_written(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive_path = root / "source_archive"
+            write_patch_archive(archive_path, [])
+            controller = ParticleController()
+            controller._archive = ArchiveReader.open(archive_path)
+            controller.createPatch()
+
+            with patch(
+                "pm_particle_modder.application.controller.QInputDialog.getText",
+                return_value=("my_particle_patch", True),
+            ):
+                controller.renameSelectedPatch()
+
+            self.assertEqual(controller.selectedPatchName, "my_particle_patch")
+            self.assertEqual(controller._patch_targets[0].path.name, "my_particle_patch")
+
+    def test_writing_patch_keeps_particle_resettable_against_its_opened_source(self):
+        particle_id = 404
+        source = make_particle()
+        with tempfile.TemporaryDirectory() as directory:
+            archive_path = Path(directory) / "source_archive"
+            write_patch_archive(archive_path, [particle_archive_entry(particle_id, source)])
+            archive = ArchiveReader.open(archive_path)
+            controller = ParticleController()
+            entry = archive.get_entry(particle_id, PARTICLE_TYPE_ID)
+            document = Document(
+                Path("404.particles"),
+                ParticleEffect.from_bytes(entry.toc_data),
+                QUndoStack(),
+                archive=archive,
+                archive_entry_id=particle_id,
+                source_data=entry.toc_data,
+            )
+            controller.documents_model.append(document)
+            document.undo_stack.setClean()
+            controller.setCurrentDocument(0)
+            controller.setLifetime("min", "2")
+            controller.togglePatchInclude(0)
+            controller.createPatch()
+            controller.writePatch()
+
+            resettable_role = controller.documents_model.ResettableRole
+            index = controller.documents_model.index(0)
+            self.assertFalse(document.undo_stack.isClean())
+            self.assertTrue(controller.documents_model.data(index, resettable_role))
+
+    def test_reset_can_overwrite_a_previously_written_patch_with_an_empty_patch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive_path = root / "source_archive"
+            write_patch_archive(archive_path, [])
+            controller = ParticleController()
+            controller._archive = ArchiveReader.open(archive_path)
+            controller.createPatch()
+            controller._patch_targets[0].needs_write = True
+
+            controller.writePatch()
+
+            patch = ArchiveReader.open(root / "9ba626afa44a3aa3.patch_0")
+            self.assertEqual(patch.entries, [])
+            self.assertFalse(controller._patch_targets[0].needs_write)
+
+    def test_particle_system_toggle_is_undoable(self):
+        system = self.document.effect.particle_systems[0]
+
+        self.controller.toggleParticleSystem(system.index)
+
+        self.assertFalse(system.enabled)
+        self.assertFalse(self.document.undo_stack.isClean())
+        self.controller.undo()
+        self.assertTrue(system.enabled)
+
+    def test_texture_replacement_is_detected_and_reset_from_staged_archive(self):
+        texture_id = 77
+        archive = SimpleNamespace(
+            staged_entries={(texture_id, TEXTURE_TYPE_ID): object()},
+            particle_assets=lambda effect: [],
+            texture_bindings=lambda effect: [],
+            particle_material_ids=lambda effect: [],
+            find_entry=lambda file_id, type_id: None,
+        )
+        self.document.archive = archive
+        self.controller.texture_bindings_model.set_bindings([
+            TextureBinding(0, 55, texture_id, "fixture", True)
+        ])
+        self.controller._selected_texture_index = 0
+
+        self.assertTrue(self.controller.hasTextureReplacement)
+        self.controller.resetSelectedTexture()
+
+        self.assertFalse(self.controller.hasTextureReplacement)
+        self.assertNotIn((texture_id, TEXTURE_TYPE_ID), archive.staged_entries)
+
+    def test_texture_replacement_makes_its_particle_resettable(self):
+        texture_id = 77
+        self.document.modified_texture_ids.add(texture_id)
+
+        resettable_role = self.controller.documents_model.ResettableRole
+        index = self.controller.documents_model.index(0)
+
+        self.assertTrue(self.controller.documents_model.data(index, resettable_role))
+
+    def test_texture_patch_choice_tracks_original_or_imported(self):
+        texture_id = 77
+        archive = SimpleNamespace(staged_entries={(texture_id, TEXTURE_TYPE_ID): object()})
+        self.document.archive = archive
+        self.controller.texture_bindings_model.set_bindings([
+            TextureBinding(0, 55, texture_id, "fixture", True)
+        ])
+        self.controller._selected_texture_index = 0
+
+        self.controller.setSelectedTexturePatchVersion(False)
+
+        self.assertFalse(self.controller.selectedTextureUsesImported)
+        self.assertFalse(self.controller._texture_patch_choices[(id(archive), texture_id)])
 
     def test_groups_sort_files_and_preserve_current_document(self):
         second = Document(
@@ -158,6 +555,25 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(document.group, "Effects")
             self.assertEqual(document.selections["color"], [(0, 1), (0, 3)])
             self.assertEqual(document.color_presets[0], [(0, 1)])
+
+    def test_project_restores_disabled_particle_systems(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            particle_path = root / "fixture.particles"
+            particle_path.write_bytes(make_particle())
+            project_path = root / "disabled-system.pmod"
+            project_path.write_text(json.dumps({
+                "version": 2,
+                "structure": [{"type": "file", "filepath": "fixture.particles"}],
+                "selectionStates": {
+                    "fixture.particles": {"enabledSystems": [False]},
+                },
+            }), encoding="utf-8")
+
+            controller = ParticleController()
+            controller._open_project(project_path)
+
+            self.assertFalse(controller.current_document.effect.particle_systems[0].enabled)
 
 
 if __name__ == "__main__":

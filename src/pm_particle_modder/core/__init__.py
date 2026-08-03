@@ -25,7 +25,9 @@ from .archive import (
     dds_to_png,
     parse_material,
     parse_texture,
+    preview_dds,
     parse_unit_material_ids,
+    write_patch_archive,
 )
 
 __all__ = [
@@ -53,5 +55,7 @@ __all__ = [
     "dds_to_png",
     "parse_material",
     "parse_texture",
+    "preview_dds",
     "parse_unit_material_ids",
+    "write_patch_archive",
 ]

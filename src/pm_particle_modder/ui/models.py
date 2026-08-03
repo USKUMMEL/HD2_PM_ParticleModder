@@ -20,6 +20,9 @@ class DocumentListModel(QAbstractListModel):
     DirtyRole = PathRole + 1
     VersionRole = DirtyRole + 1
     GroupRole = VersionRole + 1
+    ArchiveRole = GroupRole + 1
+    PatchIncludedRole = ArchiveRole + 1
+    ResettableRole = PatchIncludedRole + 1
 
     def __init__(self):
         super().__init__()
@@ -32,6 +35,9 @@ class DocumentListModel(QAbstractListModel):
             self.DirtyRole: QByteArray(b"dirty"),
             self.VersionRole: QByteArray(b"version"),
             self.GroupRole: QByteArray(b"group"),
+            self.ArchiveRole: QByteArray(b"archiveBacked"),
+            self.PatchIncludedRole: QByteArray(b"patchIncluded"),
+            self.ResettableRole: QByteArray(b"resettable"),
         }
 
     def rowCount(self, parent=QModelIndex()):
@@ -51,6 +57,18 @@ class DocumentListModel(QAbstractListModel):
             return f"0x{document.effect.version:X}"
         if role == self.GroupRole:
             return document.group or "Ungrouped"
+        if role == self.ArchiveRole:
+            return document.archive is not None
+        if role == self.PatchIncludedRole:
+            return document.include_in_patch
+        if role == self.ResettableRole:
+            try:
+                return (
+                    bool(document.modified_texture_ids)
+                    or bool(document.source_data) and document.effect.to_bytes() != document.source_data
+                )
+            except ValueError:
+                return not document.undo_stack.isClean()
         return None
 
     def append(self, document) -> int:
@@ -203,10 +221,12 @@ class VisualizerListModel(QAbstractListModel):
     HasMaterialRole = MeshRole + 1
     HasUnitRole = HasMaterialRole + 1
     HasMeshRole = HasUnitRole + 1
+    EnabledRole = HasMeshRole + 1
+    SystemIndexRole = EnabledRole + 1
 
     def __init__(self):
         super().__init__()
-        self.entries: list[tuple[int, Visualizer]] = []
+        self.entries = []
 
     def roleNames(self):
         return {
@@ -218,6 +238,8 @@ class VisualizerListModel(QAbstractListModel):
             self.HasMaterialRole: QByteArray(b"hasMaterial"),
             self.HasUnitRole: QByteArray(b"hasUnit"),
             self.HasMeshRole: QByteArray(b"hasMesh"),
+            self.EnabledRole: QByteArray(b"systemEnabled"),
+            self.SystemIndexRole: QByteArray(b"systemIndex"),
         }
 
     def rowCount(self, parent=QModelIndex()):
@@ -226,43 +248,50 @@ class VisualizerListModel(QAbstractListModel):
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid() or not 0 <= index.row() < len(self.entries):
             return None
-        system_index, visualizer = self.entries[index.row()]
+        system = self.entries[index.row()]
+        visualizer = system.visualizer
         if role == self.SystemRole:
-            return f"Particle System {system_index}"
+            return f"Particle System {system.index + 1}"
         if role == self.TypeRole:
-            return visualizer.type_name
+            return visualizer.type_name if visualizer is not None else "Non-rendering"
         if role == self.MaterialRole:
-            return "" if visualizer.material_id is None else str(visualizer.material_id)
+            return "" if visualizer is None or visualizer.material_id is None else str(visualizer.material_id)
         if role == self.UnitRole:
-            return "" if visualizer.unit_id is None else str(visualizer.unit_id)
+            return "" if visualizer is None or visualizer.unit_id is None else str(visualizer.unit_id)
         if role == self.MeshRole:
-            return "" if visualizer.mesh_id is None else str(visualizer.mesh_id)
+            return "" if visualizer is None or visualizer.mesh_id is None else str(visualizer.mesh_id)
         if role == self.HasMaterialRole:
-            return visualizer.material_id is not None
+            return visualizer is not None and visualizer.material_id is not None
         if role == self.HasUnitRole:
-            return visualizer.unit_id is not None
+            return visualizer is not None and visualizer.unit_id is not None
         if role == self.HasMeshRole:
-            return visualizer.mesh_id is not None
+            return visualizer is not None and visualizer.mesh_id is not None
+        if role == self.EnabledRole:
+            return system.enabled
+        if role == self.SystemIndexRole:
+            return system.index
         return None
 
     def set_effect(self, effect: ParticleEffect | None) -> None:
         self.beginResetModel()
         self.entries.clear()
         if effect is not None:
-            self.entries.extend(
-                (system.index, system.visualizer)
-                for system in effect.particle_systems
-                if system.visualizer is not None
-            )
+            self.entries.extend(effect.particle_systems)
         self.endResetModel()
 
-    def visualizer_at(self, row: int) -> Visualizer:
-        return self.entries[row][1]
+    def visualizer_at(self, row: int) -> Visualizer | None:
+        return self.entries[row].visualizer
 
     def refresh(self, row: int) -> None:
         if 0 <= row < len(self.entries):
             index = self.index(row, 0)
             self.dataChanged.emit(index, index, list(self.roleNames()))
+
+    def refresh_system(self, system_index: int) -> None:
+        for row, system in enumerate(self.entries):
+            if system.index == system_index:
+                self.refresh(row)
+                return
 
 
 class ArchiveParticleListModel(QAbstractListModel):
@@ -438,6 +467,67 @@ class TextureBindingListModel(QAbstractListModel):
         self.bindings[row] = binding
         index = self.index(row, 0)
         self.dataChanged.emit(index, index, list(self.roleNames()))
+
+
+class TextureOverviewListModel(QAbstractListModel):
+    SystemRole = Qt.ItemDataRole.UserRole + 1
+    TexturesRole = SystemRole + 1
+
+    def __init__(self):
+        super().__init__()
+        self.rows: list[tuple[int, list[TextureBinding]]] = []
+
+    def roleNames(self):
+        return {
+            self.SystemRole: QByteArray(b"systemIndex"),
+            self.TexturesRole: QByteArray(b"systemTextures"),
+        }
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.rows)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or not 0 <= index.row() < len(self.rows):
+            return None
+        system_index, bindings = self.rows[index.row()]
+        if role == self.SystemRole:
+            return system_index
+        if role == self.TexturesRole:
+            return [
+                {
+                    "systemIndex": binding.system_index,
+                    "materialId": str(binding.material_id),
+                    "textureId": str(binding.texture_id),
+                    "detail": binding.detail,
+                    "available": binding.available,
+                    "previewUrl": binding.preview_url,
+                    "previewState": binding.preview_state,
+                }
+                for binding in bindings
+            ]
+        return None
+
+    def set_bindings(self, bindings: list[TextureBinding], system_indices: list[int]) -> None:
+        grouped = []
+        for system_index in system_indices:
+            textures = [binding for binding in bindings if binding.system_index == system_index]
+            if textures:
+                grouped.append((system_index, textures))
+        self.beginResetModel()
+        self.rows = grouped
+        self.endResetModel()
+
+    def update_binding(self, binding: TextureBinding) -> None:
+        key = (binding.system_index, binding.material_id, binding.texture_id)
+        for row, (system_index, bindings) in enumerate(self.rows):
+            if system_index != binding.system_index:
+                continue
+            for index, item in enumerate(bindings):
+                if (item.system_index, item.material_id, item.texture_id) == key:
+                    bindings[index] = binding
+                    model_index = self.index(row, 0)
+                    self.dataChanged.emit(model_index, model_index, [self.TexturesRole])
+                    return
 
 
 def _color_hex(color: list[float]) -> str:

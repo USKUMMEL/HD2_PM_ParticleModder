@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 import os
 from pathlib import Path
@@ -119,13 +120,15 @@ class SlimArchiveStore:
             raise ArchiveError("bundles.nxa is too small.")
         self.packages = self._parse_packages(mapping)
         self._chunk_offsets: dict[str, dict[int, int]] = {}
-        self._readers: dict[str, ArchiveReader] = {}
+        self._readers: OrderedDict[str, ArchiveReader] = OrderedDict()
+        self._pinned_reader_names: set[str] = set()
         self._resource_locations: dict[tuple[int, int], str | None] = {}
 
     def open_archive(self, archive_id: str) -> ArchiveReader:
         normalized = archive_id.lower().removeprefix("0x")
         existing = self._readers.get(normalized)
         if existing is not None:
+            self._readers.move_to_end(normalized)
             return existing
         package = self.packages.get(normalized)
         if package is None:
@@ -134,9 +137,23 @@ class SlimArchiveStore:
         reader = ArchiveReader(
             self.data_directory / normalized, toc, b"", b"", self,
             lambda entry: self._load_entry_data(package, entry),
+            lambda entry: self._load_entry_data_full(package, entry),
         )
         self._readers[normalized] = reader
+        self._trim_reader_cache()
         return reader
+
+    def pin_archive(self, archive_id: str) -> None:
+        self._pinned_reader_names.add(archive_id.lower().removeprefix("0x"))
+
+    def _trim_reader_cache(self) -> None:
+        while len(self._readers) > 6:
+            name = next(
+                (item for item in self._readers if item not in self._pinned_reader_names), None
+            )
+            if name is None:
+                return
+            self._readers.pop(name)
 
     def find_resource(self, file_id: int, type_id: int) -> ArchiveEntry | None:
         """Resolve one resource lazily from another logical Slim archive."""
@@ -154,6 +171,25 @@ class SlimArchiveStore:
             return self.open_archive(package.name).get_entry(file_id, type_id)
         self._resource_locations[key] = None
         return None
+
+    def find_source_resource(self, file_id: int, type_id: int) -> ArchiveEntry | None:
+        key = (file_id, type_id)
+        location = self._resource_locations.get(key, ...)
+        if location is ...:
+            self.find_resource(file_id, type_id)
+            location = self._resource_locations.get(key)
+        return self.open_archive(location).source_entry(file_id, type_id) if location else None
+
+    def reload_resource_full(self, file_id: int, type_id: int) -> ArchiveEntry | None:
+        """Reload a cross-archive resource through the reader that owns it."""
+        key = (file_id, type_id)
+        location = self._resource_locations.get(key, ...)
+        if location is ...:
+            self.find_resource(file_id, type_id)
+            location = self._resource_locations.get(key)
+        if not location:
+            return None
+        return self.open_archive(location).reload_entry_full(file_id, type_id)
 
     def _package_contains(self, package: SlimPackage, key: tuple[int, int]) -> bool:
         if not package.parts:
@@ -177,6 +213,20 @@ class SlimArchiveStore:
             entry.toc_data,
             self._read_package_span(package.name + ".gpu_resources", entry.gpu_offset, entry.gpu_size),
             self._read_package_span(package.name + ".stream", entry.stream_offset, entry.stream_size),
+        )
+
+    def _load_entry_data_full(self, package: SlimPackage, entry: ArchiveEntry) -> ArchiveEntry:
+        """SDK-compatible fallback for resources that need a complete sidecar rebuild."""
+        gpu_package = self.packages.get(package.name + ".gpu_resources")
+        stream_package = self.packages.get(package.name + ".stream")
+        gpu_data = self._reconstruct(gpu_package) if gpu_package else b""
+        stream_data = self._reconstruct(stream_package) if stream_package else b""
+        _validate_span(gpu_data, entry.gpu_offset, entry.gpu_size, "GPU resource")
+        _validate_span(stream_data, entry.stream_offset, entry.stream_size, "stream resource")
+        return entry.with_data(
+            entry.toc_data,
+            gpu_data[entry.gpu_offset:entry.gpu_offset + entry.gpu_size],
+            stream_data[entry.stream_offset:entry.stream_offset + entry.stream_size],
         )
 
     def _parse_packages(self, data: bytes) -> dict[str, SlimPackage]:
@@ -304,8 +354,10 @@ class SlimArchiveStore:
 class ArchiveReader:
     """Read one standalone Stingray package without loading the Blender SDK."""
 
+    PAYLOAD_CACHE_BYTES = 96 * 1024 * 1024
+
     def __init__(self, path: Path, toc_data: bytes, gpu_data: bytes, stream_data: bytes,
-                 slim_store: SlimArchiveStore | None = None, entry_loader=None):
+                 slim_store: SlimArchiveStore | None = None, entry_loader=None, full_entry_loader=None):
         self.path = path
         self.toc_data = bytes(toc_data)
         self.gpu_data = bytes(gpu_data)
@@ -317,8 +369,10 @@ class ArchiveReader:
         self.staged_entries: dict[tuple[int, int], ArchiveEntry] = {}
         self._slim_store = slim_store
         self._entry_loader = entry_loader
-        self._loaded_entry_keys = set(self._by_key) if entry_loader is None else set()
-        self._resolved_entries: dict[tuple[int, int], ArchiveEntry | None] = {}
+        self._full_entry_loader = full_entry_loader
+        self._payload_cache: OrderedDict[tuple[int, int], ArchiveEntry] = OrderedDict()
+        self._payload_cache_size = 0
+        self._missing_entry_keys: set[tuple[int, int]] = set()
 
     @classmethod
     def open(cls, path: str | Path) -> ArchiveReader:
@@ -328,13 +382,20 @@ class ArchiveReader:
         toc_data = _read_package_data(archive_path)
         gpu_path = archive_path.with_name(archive_path.name + ".gpu_resources")
         stream_path = archive_path.with_name(archive_path.name + ".stream")
-        gpu_data = _read_package_data(gpu_path) if gpu_path.exists() else b""
-        stream_data = _read_package_data(stream_path) if stream_path.exists() else b""
-        return cls(archive_path, toc_data, gpu_data, stream_data)
+        def load_entry(entry: ArchiveEntry) -> ArchiveEntry:
+            return entry.with_data(
+                entry.toc_data,
+                _read_package_span(gpu_path, entry.gpu_offset, entry.gpu_size),
+                _read_package_span(stream_path, entry.stream_offset, entry.stream_size),
+            )
+        return cls(archive_path, toc_data, b"", b"", entry_loader=load_entry, full_entry_loader=load_entry)
 
     @classmethod
     def open_slim(cls, data_directory: str | Path, archive_id: str) -> ArchiveReader:
-        return SlimArchiveStore(data_directory).open_archive(archive_id)
+        store = SlimArchiveStore(data_directory)
+        reader = store.open_archive(archive_id)
+        store.pin_archive(archive_id)
+        return reader
 
     def get_entry(self, file_id: int, type_id: int) -> ArchiveEntry | None:
         key = (file_id, type_id)
@@ -342,22 +403,36 @@ class ArchiveReader:
         if staged is not None:
             return staged
         entry = self._by_key.get(key)
-        if entry is not None and key not in self._loaded_entry_keys:
-            entry = self._entry_loader(entry)
-            self._by_key[key] = entry
-            self._loaded_entry_keys.add(key)
-        return entry
+        return self._load_entry(entry) if entry is not None else None
+
+    def source_entry(self, file_id: int, type_id: int) -> ArchiveEntry | None:
+        """Return the unmodified resource bytes, bypassing staged replacements."""
+        key = (file_id, type_id)
+        entry = self._by_key.get(key)
+        if entry is not None:
+            return self._load_entry(entry)
+        return self._slim_store.find_source_resource(file_id, type_id) if self._slim_store else None
 
     def find_entry(self, file_id: int, type_id: int) -> ArchiveEntry | None:
         entry = self.get_entry(file_id, type_id)
         if entry is not None:
             return entry
         key = (file_id, type_id)
-        if key not in self._resolved_entries:
-            self._resolved_entries[key] = (
-                self._slim_store.find_resource(file_id, type_id) if self._slim_store else None
-            )
-        return self._resolved_entries[key]
+        if key in self._missing_entry_keys:
+            return None
+        entry = self._slim_store.find_resource(file_id, type_id) if self._slim_store else None
+        if entry is None:
+            self._missing_entry_keys.add(key)
+        return entry
+
+    def reload_entry_full(self, file_id: int, type_id: int) -> ArchiveEntry | None:
+        entry = self.get_entry(file_id, type_id)
+        if entry is None:
+            return self._slim_store.reload_resource_full(file_id, type_id) if self._slim_store else None
+        if self._full_entry_loader is None:
+            return entry
+        entry = self._full_entry_loader(self._by_key[(file_id, type_id)])
+        return self._cache_payload((file_id, type_id), entry)
 
     def entries_of_type(self, type_id: int) -> list[ArchiveEntry]:
         return [
@@ -367,6 +442,30 @@ class ArchiveReader:
 
     def stage(self, entry: ArchiveEntry) -> None:
         self.staged_entries[(entry.file_id, entry.type_id)] = entry
+
+    def _load_entry(self, entry: ArchiveEntry) -> ArchiveEntry:
+        if self._entry_loader is None:
+            return entry
+        key = (entry.file_id, entry.type_id)
+        cached = self._payload_cache.get(key)
+        if cached is not None:
+            self._payload_cache.move_to_end(key)
+            return cached
+        return self._cache_payload(key, self._entry_loader(entry))
+
+    def _cache_payload(self, key: tuple[int, int], entry: ArchiveEntry) -> ArchiveEntry:
+        size = len(entry.toc_data) + len(entry.gpu_data) + len(entry.stream_data)
+        if size > self.PAYLOAD_CACHE_BYTES:
+            return entry
+        old = self._payload_cache.pop(key, None)
+        if old is not None:
+            self._payload_cache_size -= _entry_payload_size(old)
+        self._payload_cache[key] = entry
+        self._payload_cache_size += size
+        while self._payload_cache_size > self.PAYLOAD_CACHE_BYTES:
+            _old_key, old_entry = self._payload_cache.popitem(last=False)
+            self._payload_cache_size -= _entry_payload_size(old_entry)
+        return entry
 
     def particle_assets(self, effect: ParticleEffect) -> list[AssetLink]:
         links: list[AssetLink] = []
@@ -501,11 +600,12 @@ class ArchiveReader:
         dds = png_to_dds(Path(png_path), info.dxgi_format)
         return self.replace_texture_from_dds(texture_id, dds)
 
-    def write_patch(self, path: str | Path) -> Path:
-        if not self.staged_entries:
+    def write_patch(self, path: str | Path, entries: list[ArchiveEntry] | None = None) -> Path:
+        patch_entries = list(self.staged_entries.values()) if entries is None else entries
+        if not patch_entries:
             raise ArchiveError("There are no staged archive changes to write.")
         output = Path(path).expanduser().resolve()
-        write_patch_archive(output, list(self.staged_entries.values()))
+        write_patch_archive(output, patch_entries)
         return output
 
 
@@ -520,7 +620,8 @@ def parse_material(data: bytes) -> MaterialInfo:
         raise ArchiveError("Material texture table is outside the resource.")
     texture_ids = tuple(
         texture_id for texture_id in (
-            _u64(data, texture_offset + index * 12 + 4) for index in range(texture_count)
+            _u64(data, texture_offset + texture_count * 4 + index * 8)
+            for index in range(texture_count)
         ) if texture_id not in (0, 0xFFFFFFFFFFFFFFFF)
     )
     return MaterialInfo(parent_material_id, texture_ids)
@@ -540,6 +641,18 @@ def parse_texture(entry: ArchiveEntry) -> TextureInfo:
         _u32(dds, 140),
         dds,
     )
+
+
+def preview_dds(info: TextureInfo) -> bytes:
+    """Return the first image from a texture array in the SDK's preview format."""
+    if info.array_size <= 1:
+        return info.dds
+    raw_texture = info.dds[148:]
+    if len(raw_texture) % info.array_size:
+        raise ArchiveError("Texture array data cannot be split into individual images.")
+    header = bytearray(info.dds[:148])
+    struct.pack_into("<I", header, 140, 1)
+    return bytes(header) + raw_texture[:len(raw_texture) // info.array_size]
 
 
 def parse_unit_material_ids(data: bytes) -> tuple[int, ...]:
@@ -689,6 +802,10 @@ def _parse_entries(
     return entries
 
 
+def _entry_payload_size(entry: ArchiveEntry) -> int:
+    return len(entry.toc_data) + len(entry.gpu_data) + len(entry.stream_data)
+
+
 def _toc_contains_resource(toc_data: bytes, key: tuple[int, int]) -> bool:
     if len(toc_data) < 72 or _u32(toc_data, 0) != ARCHIVE_MAGIC:
         return False
@@ -710,6 +827,28 @@ def _read_package_data(path: Path) -> bytes:
     if len(data) >= 4 and _u32(data, 0) == DSAR_MAGIC:
         return _decompress_dsar(data)
     return data
+
+
+def _read_package_span(path: Path, offset: int, size: int) -> bytes:
+    """Read a resource range without retaining an entire raw sidecar in memory."""
+    if size == 0:
+        return b""
+    if not path.is_file():
+        raise ArchiveError(f"Archive sidecar was not found: {path}")
+    with path.open("rb") as stream:
+        magic = _read_u32(stream, 0)
+        if magic != DSAR_MAGIC:
+            stream.seek(0, os.SEEK_END)
+            if offset < 0 or size < 0 or offset + size > stream.tell():
+                raise ArchiveError(f"Requested resource is outside {path.name}.")
+            stream.seek(offset)
+            data = stream.read(size)
+            if len(data) != size:
+                raise ArchiveError(f"Could not read the complete resource from {path.name}.")
+            return data
+    data = _read_package_data(path)
+    _validate_span(data, offset, size, path.name)
+    return data[offset:offset + size]
 
 
 def _decompress_dsar(data: bytes) -> bytes:

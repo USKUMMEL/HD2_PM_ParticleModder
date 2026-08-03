@@ -79,8 +79,8 @@ ApplicationWindow {
     }
 
     Shortcut { sequence: StandardKey.Open; onActivated: controller.openFiles() }
-    Shortcut { sequence: StandardKey.Save; enabled: controller.hasDocument; onActivated: controller.saveCurrent() }
-    Shortcut { sequence: StandardKey.SaveAs; enabled: controller.hasDocument; onActivated: controller.saveCurrentAs() }
+    Shortcut { sequence: StandardKey.Save; enabled: controller.documentCount > 0; onActivated: controller.saveProject() }
+    Shortcut { sequence: StandardKey.SaveAs; enabled: controller.documentCount > 0; onActivated: controller.saveProjectAs() }
     Shortcut { sequence: StandardKey.Undo; enabled: controller.canUndo; onActivated: controller.undo() }
     Shortcut { sequence: StandardKey.Redo; enabled: controller.canRedo; onActivated: controller.redo() }
 
@@ -95,35 +95,136 @@ ApplicationWindow {
             anchors.rightMargin: 16
             spacing: 8
 
-            Column {
-                Layout.preferredWidth: 190
-                spacing: 1
-                Text {
-                    text: "PM ParticleModder"
-                    color: Theme.text
-                    font.pixelSize: 16
-                    font.weight: Font.DemiBold
+            Rectangle {
+                id: fileMenuButton
+                Layout.preferredWidth: 32
+                Layout.preferredHeight: 32
+                radius: 4
+                color: fileMenuMouse.containsMouse ? Theme.surfaceHover : Theme.surfaceRaised
+                border.width: 1
+                border.color: Theme.border
+                Canvas {
+                    anchors.centerIn: parent
+                    width: 16
+                    height: 16
+                    onPaint: {
+                        const ctx = getContext("2d")
+                        ctx.clearRect(0, 0, width, height)
+                        ctx.strokeStyle = Theme.text
+                        ctx.lineWidth = 1.4
+                        ctx.strokeRect(3.5, 2.5, 8, 11)
+                        ctx.beginPath()
+                        ctx.moveTo(5.5, 5.5)
+                        ctx.lineTo(9.5, 5.5)
+                        ctx.moveTo(5.5, 8.5)
+                        ctx.lineTo(11, 8.5)
+                        ctx.moveTo(5.5, 11.5)
+                        ctx.lineTo(11, 11.5)
+                        ctx.stroke()
+                    }
                 }
-                Text {
-                    text: "PERSONAL MODDER"
-                    color: Theme.accent
-                    font.pixelSize: 9
-                    font.weight: Font.DemiBold
+                MouseArea {
+                    id: fileMenuMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: fileMenu.popup(fileMenuButton, 0, fileMenuButton.height)
                 }
+                ToolTip.visible: fileMenuMouse.containsMouse
+                ToolTip.text: "File"
+                ToolTip.delay: 500
             }
-
-            Rectangle { Layout.preferredWidth: 1; Layout.fillHeight: true; Layout.topMargin: 11; Layout.bottomMargin: 11; color: Theme.border }
-            PmButton { text: "Open"; accent: true; tooltip: "Open particle files"; onClicked: controller.openFiles() }
-            PmButton { text: "Game Data"; tooltip: "Select the Helldivers 2 data folder"; onClicked: controller.selectGameDataDirectory() }
             PmButton { text: "Load Archive"; tooltip: "Load an archive by ID or found archive name"; onClicked: window.sectionIndex = 6 }
-            PmButton { text: "Save"; enabled: controller.hasDocument; tooltip: "Save current file"; onClicked: controller.saveCurrent() }
-            PmButton { text: "Save As"; enabled: controller.hasDocument; tooltip: "Save current file as"; onClicked: controller.saveCurrentAs() }
-            PmButton { text: "Save All"; enabled: controller.hasDocument; tooltip: "Save all modified files"; onClicked: controller.saveAll() }
-            PmButton { text: "Project"; enabled: controller.documentCount > 0; tooltip: "Save PM project"; onClicked: controller.saveProject() }
-            PmButton { text: "Write Patch"; enabled: controller.stagedChangeCount > 0; tooltip: "Write staged archive changes"; onClicked: controller.writePatch() }
+            PmButton { text: "Create Patch"; tooltip: "Create a patch target"; onClicked: controller.createPatch() }
+            Rectangle {
+                id: patchSelector
+                Layout.preferredWidth: 170
+                Layout.preferredHeight: 34
+                radius: 5
+                color: patchSelectorMouse.containsMouse ? Theme.surfaceHover : Theme.surfaceRaised
+                border.width: 1
+                border.color: Theme.border
+                Text {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.leftMargin: 10
+                    anchors.rightMargin: 24
+                    text: controller.selectedPatchName
+                    color: controller.hasSelectedPatch ? Theme.text : Theme.textMuted
+                    font.pixelSize: 12
+                    elide: Text.ElideMiddle
+                }
+                Text {
+                    anchors.right: parent.right
+                    anchors.rightMargin: 8
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "v"
+                    color: Theme.textMuted
+                    font.pixelSize: 11
+                }
+                MouseArea {
+                    id: patchSelectorMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: patchMenu.popup(patchSelector, 0, patchSelector.height)
+                    onDoubleClicked: controller.renameSelectedPatch()
+                }
+                ToolTip.visible: patchSelectorMouse.containsMouse
+                ToolTip.text: controller.hasSelectedPatch ? "Click to select, double-click to rename" : "Select a patch target"
+                ToolTip.delay: 500
+            }
+            PmButton { text: "Write Patch"; enabled: controller.canWritePatch && controller.hasSelectedPatch; tooltip: "Write the selected patch"; onClicked: controller.writePatch() }
             Item { Layout.fillWidth: true }
-            PmButton { text: "Undo"; enabled: controller.canUndo; tooltip: "Undo last edit"; onClicked: controller.undo() }
-            PmButton { text: "Redo"; enabled: controller.canRedo; tooltip: "Redo last edit"; onClicked: controller.redo() }
+        }
+
+        Menu {
+            id: fileMenu
+            MenuItem { text: "Select Helldivers 2 Data Folder"; onTriggered: controller.selectGameDataDirectory() }
+            MenuSeparator {}
+            MenuItem { text: "Open Project"; onTriggered: controller.openProject() }
+            MenuItem { text: "Save Project"; enabled: controller.documentCount > 0; onTriggered: controller.saveProjectAs() }
+            MenuItem { text: "Save"; enabled: controller.documentCount > 0; onTriggered: controller.saveProject() }
+            MenuSeparator {}
+            MenuItem { text: "Open Particle"; onTriggered: controller.openFiles() }
+            MenuItem { text: "Save Particle"; enabled: controller.canSaveParticle; onTriggered: controller.saveParticle() }
+            MenuItem { text: "Save Particle As"; enabled: controller.canSaveParticle; onTriggered: controller.saveCurrentAs() }
+            MenuItem { text: "Save Patch"; enabled: controller.canWritePatch; onTriggered: controller.writePatch() }
+            MenuSeparator {}
+            MenuItem { text: "About"; onTriggered: aboutDialog.open() }
+        }
+
+        Menu {
+            id: patchMenu
+            Instantiator {
+                model: controller.patchOptions
+                delegate: MenuItem {
+                    required property int index
+                    required property string modelData
+                    text: modelData
+                    onTriggered: controller.selectPatch(index)
+                }
+                onObjectAdded: function(index, object) { patchMenu.insertItem(index, object) }
+                onObjectRemoved: function(_index, object) { patchMenu.removeItem(object) }
+            }
+            MenuItem { visible: controller.patchOptions.length === 0; enabled: false; text: "No patch targets" }
+        }
+    }
+
+    Dialog {
+        id: aboutDialog
+        title: "About PM ParticleModder"
+        modal: true
+        standardButtons: Dialog.Ok
+        anchors.centerIn: parent
+        width: 390
+        contentItem: Text {
+            text: "Tool Dev : Uskummel\nHuge thank to Hd2 modding community\nSpecial thanks to Box, Eve and other Dev of Hd2 Sdk"
+            color: Theme.text
+            font.pixelSize: 13
+            wrapMode: Text.WordWrap
+            padding: 18
         }
     }
 
@@ -243,6 +344,9 @@ ApplicationWindow {
                                 required property bool dirty
                                 required property string filePath
                                 required property string group
+                                required property bool archiveBacked
+                                required property bool patchIncluded
+                                required property bool resettable
                                 width: openParticlesList.width - 8
                                 visible: !window.isParticleGroupCollapsed(group)
                                 height: visible ? 34 : 0
@@ -256,7 +360,7 @@ ApplicationWindow {
 
                                 Text {
                                     anchors.left: parent.left
-                                    anchors.right: particleClose.left
+                                    anchors.right: particlePatch.left
                                     anchors.leftMargin: 8
                                     anchors.rightMargin: 4
                                     anchors.verticalCenter: parent.verticalCenter
@@ -267,32 +371,97 @@ ApplicationWindow {
                                     elide: Text.ElideMiddle
                                 }
                                 Rectangle {
-                                    id: particleClose
-                                    width: 24
+                                    id: particleReset
+                                    width: particleDelegate.resettable ? 24 : 0
                                     height: 24
                                     anchors.right: parent.right
                                     anchors.rightMargin: 3
                                     anchors.verticalCenter: parent.verticalCenter
                                     radius: 3
-                                    color: particleCloseMouse.containsMouse ? Theme.surfaceHover : "transparent"
-                                    Text { anchors.centerIn: parent; text: "x"; color: Theme.textMuted; font.pixelSize: 13 }
+                                    visible: width > 0
+                                    color: particleResetMouse.containsMouse ? Theme.surfaceHover : "transparent"
+                                    Canvas {
+                                        anchors.centerIn: parent
+                                        width: 16
+                                        height: 16
+                                        onPaint: {
+                                            const ctx = getContext("2d")
+                                            ctx.clearRect(0, 0, width, height)
+                                            ctx.strokeStyle = Theme.textMuted
+                                            ctx.lineWidth = 1.5
+                                            ctx.strokeRect(4, 5, 8, 9)
+                                            ctx.beginPath()
+                                            ctx.moveTo(3, 4)
+                                            ctx.lineTo(13, 4)
+                                            ctx.moveTo(6, 2.5)
+                                            ctx.lineTo(10, 2.5)
+                                            ctx.moveTo(6.5, 7)
+                                            ctx.lineTo(6.5, 12)
+                                            ctx.moveTo(9.5, 7)
+                                            ctx.lineTo(9.5, 12)
+                                            ctx.stroke()
+                                        }
+                                    }
                                     MouseArea {
-                                        id: particleCloseMouse
+                                        id: particleResetMouse
                                         anchors.fill: parent
                                         hoverEnabled: true
                                         cursorShape: Qt.PointingHandCursor
-                                    onClicked: {
-                                        controller.closeDocument(particleDelegate.index)
-                                        window.clearParticleSelection()
+                                        onClicked: controller.resetDocument(particleDelegate.index)
                                     }
+                                    ToolTip.visible: particleResetMouse.containsMouse
+                                    ToolTip.text: "Reset particle to opened source data"
+                                    ToolTip.delay: 500
+                                }
+                                Rectangle {
+                                    id: particlePatch
+                                    width: 24
+                                    height: 24
+                                    anchors.right: particleReset.left
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    radius: 3
+                                    color: particlePatchMouse.containsMouse ? Theme.surfaceHover : "transparent"
+                                    Canvas {
+                                        anchors.centerIn: parent
+                                        width: 16
+                                        height: 16
+                                        property bool included: particleDelegate.patchIncluded
+                                        onIncludedChanged: requestPaint()
+                                        onPaint: {
+                                            const ctx = getContext("2d")
+                                            ctx.clearRect(0, 0, width, height)
+                                            ctx.fillStyle = included ? Theme.accent : "transparent"
+                                            ctx.strokeStyle = included ? Theme.accent : Theme.textMuted
+                                            ctx.lineWidth = 1.5
+                                            ctx.beginPath()
+                                            ctx.moveTo(8, 2)
+                                            ctx.lineTo(13, 4.5)
+                                            ctx.lineTo(12, 10.5)
+                                            ctx.quadraticCurveTo(10.5, 13.5, 8, 15)
+                                            ctx.quadraticCurveTo(5.5, 13.5, 4, 10.5)
+                                            ctx.lineTo(3, 4.5)
+                                            ctx.closePath()
+                                            ctx.fill()
+                                            ctx.stroke()
+                                        }
                                     }
+                                    MouseArea {
+                                        id: particlePatchMouse
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: controller.togglePatchInclude(particleDelegate.index)
+                                    }
+                                    ToolTip.visible: particlePatchMouse.containsMouse
+                                    ToolTip.text: particleDelegate.patchIncluded ? "Included in patch" : "Include particle in patch"
+                                    ToolTip.delay: 500
                                 }
                                 MouseArea {
                                     id: particleMouse
                                     anchors.left: parent.left
                                     anchors.top: parent.top
                                     anchors.bottom: parent.bottom
-                                    anchors.right: particleClose.left
+                                    anchors.right: particlePatch.left
                                     hoverEnabled: true
                                     acceptedButtons: Qt.LeftButton | Qt.RightButton
                                     cursorShape: Qt.PointingHandCursor
@@ -339,7 +508,7 @@ ApplicationWindow {
                         font.weight: Font.DemiBold
                     }
                     Repeater {
-                        model: ["Color", "Opacity", "Intensity", "Lifetime", "Visualizers", "Texture", "Archive"]
+                        model: ["Color", "Opacity", "Intensity", "Lifetime", "Visualizers", "Texture"]
                         delegate: Rectangle {
                             id: navItem
                             required property int index
@@ -380,12 +549,24 @@ ApplicationWindow {
                     }
                     Item { Layout.fillHeight: true }
                     Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.border }
-                    Text {
+                    ColumnLayout {
                         Layout.fillWidth: true
-                        text: controller.hasDocument ? "VERSION  " + controller.versionText : "NO DOCUMENT"
-                        color: Theme.textMuted
-                        font.pixelSize: 10
-                        horizontalAlignment: Text.AlignHCenter
+                        spacing: 2
+                        Text {
+                            Layout.fillWidth: true
+                            text: controller.hasDocument ? "PARTICLE  " + controller.versionText : "NO DOCUMENT"
+                            color: Theme.textMuted
+                            font.pixelSize: 10
+                            horizontalAlignment: Text.AlignHCenter
+                        }
+                        Text {
+                            Layout.fillWidth: true
+                            text: "PM ParticleModder Version " + controller.applicationVersion
+                            color: Theme.textMuted
+                            font.pixelSize: 9
+                            horizontalAlignment: Text.AlignHCenter
+                            elide: Text.ElideRight
+                        }
                     }
                 }
 
@@ -450,7 +631,7 @@ ApplicationWindow {
                     }
                     MenuSeparator { }
                     MenuItem {
-                        text: "Close selected from PM"
+                        text: "Delete selected from PM"
                         enabled: fileContextMenu.targetIndexes.length > 0
                         onTriggered: {
                             controller.closeDocuments(fileContextMenu.targetIndexes)
@@ -610,10 +791,12 @@ ApplicationWindow {
                                     required property bool hasMaterial
                                     required property bool hasUnit
                                     required property bool hasMesh
+                                    required property bool systemEnabled
+                                    required property int systemIndex
                                     width: visualizerList.width - 12
                                     height: 74 + (hasMaterial ? 54 : 0) + (hasUnit ? 54 : 0) + (hasMesh ? 54 : 0)
                                     radius: 6
-                                    color: Theme.surface
+                                    color: systemEnabled ? Theme.surface : Theme.surfaceHover
                                     border.width: 1
                                     border.color: Theme.border
                                     ColumnLayout {
@@ -624,6 +807,12 @@ ApplicationWindow {
                                             Layout.fillWidth: true
                                             Text { text: visualizerDelegate.systemLabel; color: Theme.text; font.pixelSize: 14; font.weight: Font.DemiBold }
                                             Item { Layout.fillWidth: true }
+                                            CheckBox {
+                                                id: systemEnabledToggle
+                                                checked: visualizerDelegate.systemEnabled
+                                                text: "Enabled"
+                                                onClicked: controller.toggleParticleSystem(visualizerDelegate.systemIndex)
+                                            }
                                             Text { text: visualizerDelegate.visualizerType; color: Theme.accent; font.pixelSize: 12 }
                                         }
                                         Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.border }
@@ -647,6 +836,14 @@ ApplicationWindow {
                             id: texturePanel
                             property int selectedTextureIndex: -1
                             property bool listView: controller.textureListView
+                            property bool compareTexture: false
+                            Connections {
+                                target: controller
+                                function onStateChanged() {
+                                    if (!controller.hasTextureReplacement)
+                                        texturePanel.compareTexture = false
+                                }
+                            }
                             ColumnLayout {
                                 anchors.fill: parent
                                 anchors.margins: 16
@@ -673,13 +870,72 @@ ApplicationWindow {
                                                     radius: 3
                                                     color: (texturePanel.listView === (index === 1)) ? Theme.surfaceRaised : "transparent"
                                                     Text { anchors.centerIn: parent; text: modelData; color: (texturePanel.listView === (index === 1)) ? Theme.text : Theme.textMuted; font.pixelSize: 10; font.weight: Font.DemiBold }
-                                                    MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: controller.setTextureListView(index === 1) }
+                                                    MouseArea {
+                                                        anchors.fill: parent
+                                                        cursorShape: Qt.PointingHandCursor
+                                                        onClicked: {
+                                                            if (index === 1)
+                                                                texturePanel.compareTexture = false
+                                                            controller.setTextureListView(index === 1)
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
                                     }
+                                    PmButton { text: "Export PNG"; enabled: controller.hasSelectedTexture; onClicked: controller.exportSelectedTexturePng() }
+                                    PmButton { text: "Export DDS"; enabled: controller.hasSelectedTexture; onClicked: controller.exportSelectedTextureDds() }
                                     PmButton { text: "Import PNG"; enabled: controller.hasSelectedTexture; onClicked: controller.importSelectedTexturePng() }
                                     PmButton { text: "Import DDS"; enabled: controller.hasSelectedTexture; onClicked: controller.importSelectedTextureDds() }
+                                    PmButton {
+                                        visible: !texturePanel.listView && controller.hasTextureReplacement
+                                        text: texturePanel.compareTexture ? "Viewer" : "Compare"
+                                        onClicked: texturePanel.compareTexture = !texturePanel.compareTexture
+                                    }
+                                    Rectangle {
+                                        Layout.preferredWidth: 30
+                                        Layout.preferredHeight: 30
+                                        visible: !texturePanel.listView && controller.hasTextureReplacement
+                                        radius: 4
+                                        color: resetTextureMouse.containsMouse ? Theme.surfaceHover : Theme.surfaceRaised
+                                        border.width: 1
+                                        border.color: Theme.border
+                                        Canvas {
+                                            anchors.centerIn: parent
+                                            width: 16
+                                            height: 16
+                                            onPaint: {
+                                                const ctx = getContext("2d")
+                                                ctx.clearRect(0, 0, width, height)
+                                                ctx.strokeStyle = Theme.textMuted
+                                                ctx.lineWidth = 1.5
+                                                ctx.strokeRect(4, 5, 8, 9)
+                                                ctx.beginPath()
+                                                ctx.moveTo(3, 4)
+                                                ctx.lineTo(13, 4)
+                                                ctx.moveTo(6, 2.5)
+                                                ctx.lineTo(10, 2.5)
+                                                ctx.moveTo(6.5, 7)
+                                                ctx.lineTo(6.5, 12)
+                                                ctx.moveTo(9.5, 7)
+                                                ctx.lineTo(9.5, 12)
+                                                ctx.stroke()
+                                            }
+                                        }
+                                        MouseArea {
+                                            id: resetTextureMouse
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: {
+                                                texturePanel.compareTexture = false
+                                                controller.resetSelectedTexture()
+                                            }
+                                        }
+                                        ToolTip.visible: resetTextureMouse.containsMouse
+                                        ToolTip.text: "Reset texture to original data"
+                                        ToolTip.delay: 500
+                                    }
                                 }
                                 RowLayout {
                                     Layout.fillWidth: true
@@ -693,7 +949,7 @@ ApplicationWindow {
                                         Layout.preferredHeight: 38
                                         model: controller.textureSystemOptions
                                         enabled: model.length > 0
-                                        currentIndex: 0
+                                        currentIndex: Math.max(0, controller.textureSystemOptions.indexOf("Particle System " + (controller.selectedTextureSystemIndex + 1)))
                                         onActivated: controller.selectTextureSystem(currentIndex)
                                         contentItem: Text {
                                             leftPadding: 11
@@ -713,7 +969,7 @@ ApplicationWindow {
                                         Layout.preferredHeight: 38
                                         model: controller.textureMaterialOptions
                                         enabled: model.length > 0
-                                        currentIndex: 0
+                                        currentIndex: Math.max(0, controller.textureMaterialOptions.indexOf(controller.selectedTextureMaterialId))
                                         onActivated: controller.selectTextureMaterial(currentIndex)
                                         contentItem: Text {
                                             leftPadding: 11
@@ -770,13 +1026,157 @@ ApplicationWindow {
                                         Item {
                                             Layout.fillWidth: true
                                             Layout.fillHeight: true
-                                            Image {
+                                            Flickable {
+                                                id: texturePreviewViewport
                                                 anchors.fill: parent
                                                 anchors.margins: 12
-                                                source: controller.texturePreviewUrl
-                                                fillMode: Image.PreserveAspectFit
-                                                asynchronous: true
-                                                visible: source !== "" && status === Image.Ready
+                                                visible: !texturePanel.compareTexture
+                                                clip: true
+                                                interactive: texturePreviewImage.status === Image.Ready
+                                                flickableDirection: Flickable.HorizontalAndVerticalFlick
+                                                boundsBehavior: Flickable.StopAtBounds
+                                                property real zoom: 1.0
+                                                property real baseScale: texturePreviewImage.sourceSize.width > 0 && texturePreviewImage.sourceSize.height > 0
+                                                                          ? Math.min(width / texturePreviewImage.sourceSize.width, height / texturePreviewImage.sourceSize.height)
+                                                                          : 1.0
+                                                property real imageWidth: texturePreviewImage.sourceSize.width * baseScale * zoom
+                                                property real imageHeight: texturePreviewImage.sourceSize.height * baseScale * zoom
+                                                contentWidth: Math.max(width, imageWidth)
+                                                contentHeight: Math.max(height, imageHeight)
+
+                                                function zoomAt(pointX, pointY, factor) {
+                                                    if (texturePreviewImage.status !== Image.Ready)
+                                                        return
+                                                    const oldImageX = texturePreviewImage.x
+                                                    const oldImageY = texturePreviewImage.y
+                                                    const imagePointX = (contentX + pointX - oldImageX) / imageWidth
+                                                    const imagePointY = (contentY + pointY - oldImageY) / imageHeight
+                                                    zoom = Math.max(1, Math.min(8, zoom * factor))
+                                                    contentX = texturePreviewImage.x + imagePointX * imageWidth - pointX
+                                                    contentY = texturePreviewImage.y + imagePointY * imageHeight - pointY
+                                                }
+
+                                                Image {
+                                                    id: texturePreviewImage
+                                                    width: texturePreviewViewport.imageWidth
+                                                    height: texturePreviewViewport.imageHeight
+                                                    x: (texturePreviewViewport.contentWidth - width) / 2
+                                                    y: (texturePreviewViewport.contentHeight - height) / 2
+                                                    source: controller.texturePreviewUrl
+                                                    asynchronous: true
+                                                    cache: false
+                                                    visible: source !== "" && status === Image.Ready
+                                                    onSourceChanged: {
+                                                        texturePreviewViewport.zoom = 1
+                                                        texturePreviewViewport.contentX = 0
+                                                        texturePreviewViewport.contentY = 0
+                                                    }
+                                                }
+
+                                                WheelHandler {
+                                                    acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                                                    onWheel: function(event) {
+                                                        texturePreviewViewport.zoomAt(
+                                                            event.x, event.y,
+                                                            event.angleDelta.y > 0 ? 1.15 : 1 / 1.15
+                                                        )
+                                                        event.accepted = true
+                                                    }
+                                                }
+                                            }
+                                            RowLayout {
+                                                anchors.fill: parent
+                                                anchors.margins: 14
+                                                visible: texturePanel.compareTexture
+                                                spacing: 12
+                                                ColumnLayout {
+                                                    Layout.fillWidth: true
+                                                    Layout.fillHeight: true
+                                                    spacing: 6
+                                                    Text { text: "ORIGINAL"; color: Theme.textMuted; font.pixelSize: 10; font.weight: Font.DemiBold }
+                                                    Rectangle {
+                                                        id: originalTextureOption
+                                                        Layout.fillWidth: true
+                                                        Layout.fillHeight: true
+                                                        color: Theme.background
+                                                        border.width: controller.selectedTextureUsesImported ? 1 : 2
+                                                        border.color: controller.selectedTextureUsesImported ? Theme.border : Theme.accent
+                                                        Image {
+                                                            anchors.fill: parent
+                                                            anchors.margins: 8
+                                                            source: controller.textureOriginalPreviewUrl
+                                                            fillMode: Image.PreserveAspectFit
+                                                            asynchronous: true
+                                                            cache: false
+                                                        }
+                                                        Rectangle {
+                                                            anchors.top: parent.top
+                                                            anchors.right: parent.right
+                                                            anchors.margins: 7
+                                                            visible: !controller.selectedTextureUsesImported
+                                                            width: 160
+                                                            height: 24
+                                                            radius: 3
+                                                            color: Theme.accent
+                                                            Text {
+                                                                anchors.centerIn: parent
+                                                                text: "SELECTED FOR WRITE PATCH"
+                                                                color: Theme.accentText
+                                                                font.pixelSize: 9
+                                                                font.weight: Font.DemiBold
+                                                            }
+                                                        }
+                                                        MouseArea {
+                                                            anchors.fill: parent
+                                                            cursorShape: Qt.PointingHandCursor
+                                                            onClicked: controller.setSelectedTexturePatchVersion(false)
+                                                        }
+                                                    }
+                                                }
+                                                ColumnLayout {
+                                                    Layout.fillWidth: true
+                                                    Layout.fillHeight: true
+                                                    spacing: 6
+                                                    Text { text: "IMPORTED"; color: Theme.accent; font.pixelSize: 10; font.weight: Font.DemiBold }
+                                                    Rectangle {
+                                                        id: importedTextureOption
+                                                        Layout.fillWidth: true
+                                                        Layout.fillHeight: true
+                                                        color: Theme.background
+                                                        border.width: controller.selectedTextureUsesImported ? 2 : 1
+                                                        border.color: controller.selectedTextureUsesImported ? Theme.accent : Theme.accentStrong
+                                                        Image {
+                                                            anchors.fill: parent
+                                                            anchors.margins: 8
+                                                            source: controller.texturePreviewUrl
+                                                            fillMode: Image.PreserveAspectFit
+                                                            asynchronous: true
+                                                            cache: false
+                                                        }
+                                                        Rectangle {
+                                                            anchors.top: parent.top
+                                                            anchors.right: parent.right
+                                                            anchors.margins: 7
+                                                            visible: controller.selectedTextureUsesImported
+                                                            width: 160
+                                                            height: 24
+                                                            radius: 3
+                                                            color: Theme.accent
+                                                            Text {
+                                                                anchors.centerIn: parent
+                                                                text: "SELECTED FOR WRITE PATCH"
+                                                                color: Theme.accentText
+                                                                font.pixelSize: 9
+                                                                font.weight: Font.DemiBold
+                                                            }
+                                                        }
+                                                        MouseArea {
+                                                            anchors.fill: parent
+                                                            cursorShape: Qt.PointingHandCursor
+                                                            onClicked: controller.setSelectedTexturePatchVersion(true)
+                                                        }
+                                                    }
+                                                }
                                             }
                                             Text {
                                                 anchors.centerIn: parent
@@ -786,7 +1186,7 @@ ApplicationWindow {
                                                 text: controller.texturePreviewMessage
                                                 color: Theme.textMuted
                                                 font.pixelSize: 12
-                                                visible: controller.texturePreviewUrl === ""
+                                                visible: !texturePanel.compareTexture && controller.texturePreviewUrl === ""
                                             }
                                             Text {
                                                 anchors.horizontalCenter: parent.horizontalCenter
@@ -795,7 +1195,7 @@ ApplicationWindow {
                                                 text: controller.texturePreviewMessage
                                                 color: Theme.textMuted
                                                 font.pixelSize: 11
-                                                visible: controller.texturePreviewUrl !== ""
+                                                visible: !texturePanel.compareTexture && controller.texturePreviewUrl !== ""
                                             }
                                         }
                                     }
@@ -812,12 +1212,13 @@ ApplicationWindow {
                                         id: textureOverviewList
                                         anchors.fill: parent
                                         anchors.margins: 10
-                                        model: controller.textureOverviewRows
+                                        model: textureOverviewModel
                                         clip: true
                                         spacing: 7
                                         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
                                         delegate: Rectangle {
-                                            required property var modelData
+                                            required property int systemIndex
+                                            required property var systemTextures
                                             width: textureOverviewList.width - 8
                                             height: 126
                                             color: Theme.background
@@ -831,7 +1232,7 @@ ApplicationWindow {
                                                 Text {
                                                     Layout.preferredWidth: 188
                                                     Layout.fillHeight: true
-                                                    text: "Particle System " + (modelData.systemIndex + 1) + ":"
+                                                    text: "Particle System " + (systemIndex + 1) + ":"
                                                     color: Theme.text
                                                     font.pixelSize: 12
                                                     font.weight: Font.DemiBold
@@ -850,7 +1251,7 @@ ApplicationWindow {
                                                         id: overviewTextures
                                                         spacing: 7
                                                         Repeater {
-                                                            model: modelData.textures
+                                                            model: systemTextures
                                                             delegate: Rectangle {
                                                                 required property var modelData
                                                                 width: 108
@@ -871,6 +1272,9 @@ ApplicationWindow {
                                                                     source: modelData.previewUrl
                                                                     fillMode: Image.PreserveAspectFit
                                                                     asynchronous: true
+                                                                    cache: false
+                                                                    sourceSize.width: 192
+                                                                    sourceSize.height: 192
                                                                     visible: modelData.previewState === "ready" && status === Image.Ready
                                                                 }
                                                                 Text {
@@ -902,6 +1306,8 @@ ApplicationWindow {
                                                                     cursorShape: Qt.PointingHandCursor
                                                                     onClicked: controller.selectTextureBinding(modelData.systemIndex, modelData.materialId, modelData.textureId)
                                                                 }
+                                                                ToolTip.visible: overviewMouse.containsMouse && modelData.previewState === "failed"
+                                                                ToolTip.text: modelData.detail
                                                             }
                                                         }
                                                     }
@@ -945,8 +1351,7 @@ ApplicationWindow {
                                         font.pixelSize: 11
                                         font.weight: Font.DemiBold
                                     }
-                                    PmButton { text: "Game Data"; accent: true; onClicked: controller.selectGameDataDirectory() }
-                                    PmButton { text: "Write Patch"; enabled: controller.stagedChangeCount > 0; onClicked: controller.writePatch() }
+                                    PmButton { text: "Select"; tooltip: "Select a game or mod archive file"; onClicked: controller.selectArchiveFile() }
                                 }
                                 RowLayout {
                                     Layout.fillWidth: true
@@ -1054,27 +1459,56 @@ ApplicationWindow {
                         }
 
                         Item {
-                            Column {
+                            ColumnLayout {
                                 anchors.centerIn: parent
-                                spacing: 8
+                                width: Math.min(440, parent.width - 48)
+                                spacing: 10
                                 Text {
-                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    Layout.alignment: Qt.AlignHCenter
                                     text: "PM ParticleModder"
                                     color: Theme.text
                                     font.pixelSize: 22
                                     font.weight: Font.DemiBold
                                 }
                                 Text {
-                                    anchors.horizontalCenter: parent.horizontalCenter
-                                    text: "Open a .particles file to begin"
+                                    Layout.fillWidth: true
+                                    horizontalAlignment: Text.AlignHCenter
+                                    text: "Open a archive, .particle file or a project to start"
                                     color: Theme.textMuted
                                     font.pixelSize: 13
+                                    wrapMode: Text.WordWrap
+                                }
+                                RowLayout {
+                                    Layout.alignment: Qt.AlignHCenter
+                                    spacing: 8
+                                    PmButton {
+                                        text: "Open Archive"
+                                        onClicked: window.sectionIndex = 6
+                                    }
+                                    PmButton {
+                                        text: "Open .particle"
+                                        onClicked: controller.openFiles()
+                                    }
+                                    PmButton {
+                                        text: "Open Project"
+                                        onClicked: controller.openProject()
+                                    }
+                                }
+                                Text {
+                                    Layout.fillWidth: true
+                                    visible: !controller.hasGameDataDirectory
+                                    horizontalAlignment: Text.AlignHCenter
+                                    text: "HELLDIVERS 2 DATA FOLDER NOT SELECTED"
+                                    color: Theme.danger
+                                    font.pixelSize: 11
+                                    font.weight: Font.DemiBold
                                 }
                                 PmButton {
-                                    anchors.horizontalCenter: parent.horizontalCenter
-                                    text: "Open File"
-                                    accent: true
-                                    onClicked: controller.openFiles()
+                                    Layout.alignment: Qt.AlignHCenter
+                                    visible: !controller.hasGameDataDirectory
+                                    text: "Add Game Folder Path"
+                                    warning: true
+                                    onClicked: controller.selectGameDataDirectory()
                                 }
                             }
                         }

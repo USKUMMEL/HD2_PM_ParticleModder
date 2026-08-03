@@ -5,11 +5,13 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import tempfile
 from urllib.request import urlopen
 import xml.etree.ElementTree as ET
+import zlib
 
-from PySide6.QtCore import Property, QObject, QRunnable, QThreadPool, QUrl, Signal, Slot
+from PySide6.QtCore import Property, QObject, QRunnable, QStandardPaths, QThreadPool, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QUndoCommand, QUndoStack
 from PySide6.QtWidgets import (
     QApplication,
@@ -19,9 +21,11 @@ from PySide6.QtWidgets import (
     QMessageBox,
 )
 
+from pm_particle_modder import __version__
 from pm_particle_modder.core import (
     PARTICLE_TYPE_ID,
     TEXTURE_TYPE_ID,
+    ArchiveEntry,
     ArchiveError,
     ArchiveReader,
     ColorGraph,
@@ -30,6 +34,8 @@ from pm_particle_modder.core import (
     ParticleEffect,
     ParticleParseError,
     parse_texture,
+    preview_dds,
+    write_patch_archive,
 )
 from pm_particle_modder.ui.models import (
     ArchiveParticleListModel,
@@ -38,6 +44,7 @@ from pm_particle_modder.ui.models import (
     FoundArchiveListModel,
     ParticleTableModel,
     TextureBindingListModel,
+    TextureOverviewListModel,
     VisualizerListModel,
 )
 
@@ -58,6 +65,18 @@ class Document:
     archive: ArchiveReader | None = None
     archive_entry_id: int | None = None
     title: str = ""
+    source_data: bytes = b""
+    include_in_patch: bool = False
+    patch_entry_id: int | None = None
+    modified_texture_ids: set[int] = field(default_factory=set)
+
+
+@dataclass
+class PatchTarget:
+    path: Path
+    name: str
+    archive: ArchiveReader
+    needs_write: bool = False
 
 
 class ValueEditCommand(QUndoCommand):
@@ -92,7 +111,7 @@ class BulkEditCommand(QUndoCommand):
 
 
 class TexturePreviewSignals(QObject):
-    loaded = Signal(int, object, str, str)
+    loaded = Signal(int, object, str, str, str)
 
 
 class TexturePreviewTask(QRunnable):
@@ -107,33 +126,50 @@ class TexturePreviewTask(QRunnable):
 
     def run(self) -> None:
         preview_url = ""
+        original_preview_url = ""
         result = self.binding
         try:
             entry = self.archive.find_entry(self.binding.texture_id, TEXTURE_TYPE_ID)
             if entry is None:
                 message = "Texture was not found in the available Slim archives."
             else:
-                info = parse_texture(entry)
-                result = replace(
-                    self.binding,
-                    detail=f"{info.width} x {info.height} | DXGI {info.dxgi_format}",
-                    available=True,
-                )
-                cache_directory = Path(tempfile.gettempdir()) / "pm-particlemodder" / "texture-previews"
-                preview = dds_to_png(info.dds, cache_directory, str(self.binding.texture_id))
-                preview_url = QUrl.fromLocalFile(str(preview)).toString()
+                try:
+                    result, preview_url = self._convert_entry(entry, "current")
+                except ArchiveError:
+                    full_entry = self.archive.reload_entry_full(self.binding.texture_id, TEXTURE_TYPE_ID)
+                    if full_entry is None or full_entry is entry:
+                        raise
+                    result, preview_url = self._convert_entry(full_entry, "current")
+                source_entry = self.archive.source_entry(self.binding.texture_id, TEXTURE_TYPE_ID)
+                if source_entry is not None:
+                    try:
+                        _source_result, original_preview_url = self._convert_entry(source_entry, "original")
+                    except ArchiveError:
+                        original_preview_url = ""
                 self.signals.loaded.emit(
-                    self.request_id,
-                    replace(result, preview_url=preview_url, preview_state="ready"),
-                    preview_url,
-                    result.detail,
+                    self.request_id, result, preview_url, original_preview_url, result.detail
                 )
                 return
         except ArchiveError as error:
             message = str(error)
         self.signals.loaded.emit(
-            self.request_id, replace(result, preview_state="failed"), preview_url, message
+            self.request_id, replace(result, detail=message, preview_state="failed"), preview_url,
+            original_preview_url, message
         )
+
+    def _convert_entry(self, entry, variant: str):
+        info = parse_texture(entry)
+        result = replace(
+            self.binding,
+            detail=f"{info.width} x {info.height} | DXGI {info.dxgi_format}",
+            available=True,
+        )
+        cache_directory = Path(tempfile.gettempdir()) / "pm-particlemodder" / "texture-previews"
+        preview = dds_to_png(
+            preview_dds(info), cache_directory,
+            f"{self.binding.texture_id}-{variant}-{zlib.crc32(info.dds):08x}",
+        )
+        return replace(result, preview_url=QUrl.fromLocalFile(str(preview)).toString(), preview_state="ready"), QUrl.fromLocalFile(str(preview)).toString()
 
 
 class ParticleController(QObject):
@@ -141,8 +177,9 @@ class ParticleController(QObject):
     currentDocumentChanged = Signal()
     statusChanged = Signal()
     ARCHIVE_LIST_URL = "https://raw.githubusercontent.com/Boxofbiscuits97/HD2SDK-CommunityEdition/main/hashlists/archivehashes.json"
+    BASE_PATCH_ARCHIVE_ID = "9ba626afa44a3aa3"
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, settings_path: str | Path | None = None):
         super().__init__(parent)
         self.documents_model = DocumentListModel()
         self.color_model = ParticleTableModel("color")
@@ -155,9 +192,16 @@ class ParticleController(QObject):
         self.found_archives_model = FoundArchiveListModel()
         self.asset_links_model = AssetLinkListModel()
         self.texture_bindings_model = TextureBindingListModel()
+        self.texture_overview_model = TextureOverviewListModel()
         self._current_index = -1
         self._archive: ArchiveReader | None = None
+        self._project_path: Path | None = None
+        self._patch_targets: list[PatchTarget] = []
+        self._selected_patch_index = -1
+        self._next_patch_number = 0
         self._game_data_directory: Path | None = None
+        self._settings_path = Path(settings_path) if settings_path is not None else self._default_settings_path()
+        self._custom_picker_colors: list[str] = []
         self._archive_names: dict[str, str] | None = None
         self._selected_asset_index = -1
         self._selected_texture_index = -1
@@ -167,8 +211,10 @@ class ParticleController(QObject):
         self._texture_materials_by_system: dict[int, list[int]] = {}
         self._selected_texture_system = -1
         self._selected_texture_material = -1
+        self._texture_patch_choices: dict[tuple[int, int], bool] = {}
         self._texture_list_view = False
         self._texture_preview_url = ""
+        self._texture_original_preview_url = ""
         self._texture_preview_message = "Select a texture to preview it."
         self._texture_preview_request = 0
         self._texture_preview_pool = QThreadPool(self)
@@ -177,6 +223,7 @@ class ParticleController(QObject):
         self._texture_overview_pool = QThreadPool(self)
         self._texture_overview_pool.setMaxThreadCount(1)
         self._status = "Ready"
+        self._load_preferences()
 
     @Property(int, notify=currentDocumentChanged)
     def currentIndex(self) -> int:
@@ -185,6 +232,10 @@ class ParticleController(QObject):
     @Property(bool, notify=stateChanged)
     def hasDocument(self) -> bool:
         return self.current_document is not None
+
+    @Property(str, constant=True)
+    def applicationVersion(self) -> str:
+        return __version__
 
     @Property(int, notify=stateChanged)
     def documentCount(self) -> int:
@@ -234,30 +285,29 @@ class ParticleController(QObject):
     def textureListView(self) -> bool:
         return self._texture_list_view
 
-    @Property("QVariantList", notify=stateChanged)
-    def textureOverviewRows(self):
-        rows = []
-        for system_index in self._texture_system_indices:
-            textures = [
-                {
-                    "systemIndex": binding.system_index,
-                    "materialId": str(binding.material_id),
-                    "textureId": str(binding.texture_id),
-                    "detail": binding.detail,
-                    "available": binding.available,
-                    "previewUrl": binding.preview_url,
-                    "previewState": binding.preview_state,
-                }
-                for binding in self._all_texture_bindings
-                if binding.system_index == system_index
-            ]
-            if textures:
-                rows.append({"systemIndex": system_index, "textures": textures})
-        return rows
-
     @Property(str, notify=stateChanged)
     def texturePreviewUrl(self) -> str:
         return self._texture_preview_url
+
+    @Property(str, notify=stateChanged)
+    def textureOriginalPreviewUrl(self) -> str:
+        return self._texture_original_preview_url
+
+    @Property(bool, notify=stateChanged)
+    def hasTextureReplacement(self) -> bool:
+        binding = self._selected_texture_binding()
+        if binding is None:
+            return False
+        key = (binding.texture_id, TEXTURE_TYPE_ID)
+        return any(key in archive.staged_entries for archive in self._archives_for_patch())
+
+    @Property(bool, notify=stateChanged)
+    def selectedTextureUsesImported(self) -> bool:
+        binding = self._selected_texture_binding()
+        document = self.current_document
+        if binding is None or document is None or document.archive is None:
+            return True
+        return self._texture_patch_choices.get((id(document.archive), binding.texture_id), True)
 
     @Property(str, notify=stateChanged)
     def texturePreviewMessage(self) -> str:
@@ -286,7 +336,39 @@ class ParticleController(QObject):
 
     @Property(int, notify=stateChanged)
     def stagedChangeCount(self) -> int:
-        return len(self._archive.staged_entries) if self._archive else 0
+        included = sum(1 for document in self.documents_model.documents if document.include_in_patch)
+        staged = sum(
+            1
+            for archive in self._archives_for_patch()
+            for _file_id, type_id in archive.staged_entries
+            if type_id != PARTICLE_TYPE_ID
+        )
+        return included + staged
+
+    @Property(bool, notify=stateChanged)
+    def canWritePatch(self) -> bool:
+        return self.stagedChangeCount > 0 or (
+            self.hasSelectedPatch and self._patch_targets[self._selected_patch_index].needs_write
+        )
+
+    @Property("QVariantList", notify=stateChanged)
+    def patchOptions(self):
+        return [target.name for target in self._patch_targets]
+
+    @Property(str, notify=stateChanged)
+    def selectedPatchName(self) -> str:
+        if 0 <= self._selected_patch_index < len(self._patch_targets):
+            return self._patch_targets[self._selected_patch_index].name
+        return "Select patch"
+
+    @Property(bool, notify=stateChanged)
+    def hasSelectedPatch(self) -> bool:
+        return 0 <= self._selected_patch_index < len(self._patch_targets)
+
+    @Property(bool, notify=stateChanged)
+    def canSaveParticle(self) -> bool:
+        document = self.current_document
+        return document is not None and document.archive is None
 
     @Property("QVariantList", notify=stateChanged)
     def groupNames(self):
@@ -351,12 +433,22 @@ class ParticleController(QObject):
         self._open_paths([Path(path) for path in paths])
 
     @Slot()
+    def openProject(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(None, "Open PM project", "", "PM Projects (*.pmod)")
+        if path:
+            self._open_project(Path(path))
+
+    @Slot()
     def openArchive(self) -> None:
+        self.selectArchiveFile()
+
+    @Slot()
+    def selectArchiveFile(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             None,
-            "Open Helldivers 2 archive",
-            "",
-            "Archive files (*);;All Files (*.*)",
+            "Select Helldivers 2 or mod archive",
+            str(self._game_data_directory) if self._game_data_directory else "",
+            "Archive and patch files (*);;All Files (*.*)",
         )
         if path:
             self._open_archive(Path(path))
@@ -371,6 +463,7 @@ class ParticleController(QObject):
             self._show_error("Invalid game data folder", "Could not find bundles.nxa in this folder.")
             return
         self._game_data_directory = data_directory
+        self._save_preferences()
         self._set_status(f"Game data folder set: {data_directory}")
         self.stateChanged.emit()
 
@@ -470,6 +563,7 @@ class ParticleController(QObject):
         self.asset_links_model.set_links([])
         self._all_texture_bindings = []
         self.texture_bindings_model.set_bindings([])
+        self.texture_overview_model.set_bindings([], [])
         self._selected_asset_index = -1
         self._selected_texture_index = -1
         self._texture_system_indices = []
@@ -478,6 +572,7 @@ class ParticleController(QObject):
         self._selected_texture_system = -1
         self._selected_texture_material = -1
         self._texture_preview_url = ""
+        self._texture_original_preview_url = ""
         self._texture_preview_message = "Open an archive particle to preview textures."
         self.stateChanged.emit()
 
@@ -491,7 +586,12 @@ class ParticleController(QObject):
     def _open_archive_particle(self, entry, group: str, select: bool):
         if self._archive is None:
             return None
-        path = self._archive.path.with_name(f"{self._archive.path.name} [{entry.file_id}].particles")
+        return self._open_archive_particle_from(self._archive, entry, group, select)
+
+    def _open_archive_particle_from(
+        self, archive: ArchiveReader, entry, group: str, select: bool
+    ) -> Document | None:
+        path = archive.path.with_name(f"{archive.path.name} [{entry.file_id}].particles")
         try:
             effect = ParticleEffect.from_bytes(entry.toc_data)
         except ParticleParseError as error:
@@ -506,8 +606,9 @@ class ParticleController(QObject):
                 return document
         stack = QUndoStack(self)
         document = Document(
-            path, effect, stack, group=group, archive=self._archive,
+            path, effect, stack, group=group, archive=archive,
             archive_entry_id=entry.file_id, title=f"{entry.file_id}.particle",
+            source_data=entry.toc_data,
         )
         stack.cleanChanged.connect(lambda _clean, doc=document: self._document_state_changed(doc))
         stack.canUndoChanged.connect(lambda _value: self.stateChanged.emit())
@@ -538,7 +639,7 @@ class ParticleController(QObject):
             return None
 
         stack = QUndoStack(self)
-        document = Document(path, effect, stack, note, group)
+        document = Document(path, effect, stack, note, group, source_data=effect.original_data)
         stack.cleanChanged.connect(lambda _clean, doc=document: self._document_state_changed(doc))
         stack.canUndoChanged.connect(lambda _value: self.stateChanged.emit())
         stack.canRedoChanged.connect(lambda _value: self.stateChanged.emit())
@@ -553,20 +654,31 @@ class ParticleController(QObject):
         try:
             project_data = json.loads(path.read_text(encoding="utf-8"))
             states = project_data.get("selectionStates", {})
+            archive_cache: dict[tuple[str, str], ArchiveReader] = {}
             for item in self._flatten_project_structure(project_data.get("structure", [])):
                 value = item.get("filepath", "")
-                particle_path = Path(value)
-                if not particle_path.is_absolute():
-                    particle_path = path.parent / particle_path
-                if not particle_path.exists():
-                    missing.append(str(particle_path))
-                    continue
-                document = self._open_particle(
-                    particle_path, item.get("note", ""), item.get("_group", "")
-                )
+                archive_item = item if item.get("type") == "archive_particle" else self._legacy_archive_item(value)
+                if archive_item is not None:
+                    document, error = self._open_project_archive_particle(
+                        archive_item, item.get("note", ""), item.get("_group", ""), path, archive_cache
+                    )
+                    if error:
+                        missing.append(error)
+                    state_key = self._archive_state_key(archive_item)
+                else:
+                    particle_path = Path(value)
+                    if not particle_path.is_absolute():
+                        particle_path = path.parent / particle_path
+                    if not particle_path.exists():
+                        missing.append(str(particle_path))
+                        continue
+                    document = self._open_particle(
+                        particle_path, item.get("note", ""), item.get("_group", "")
+                    )
+                    state_key = value
                 if document is None:
                     continue
-                state = states.get(value, states.get(str(particle_path), {}))
+                state = states.get(state_key, states.get(value, {}))
                 document.selections["color"] = self._selection_pairs(state.get("selection", []))
                 presets = state.get("presets", [None, None])[:2]
                 document.color_presets = [
@@ -575,6 +687,12 @@ class ParticleController(QObject):
                 ]
                 while len(document.color_presets) < 2:
                     document.color_presets.append(None)
+                enabled_systems = state.get("enabledSystems")
+                if isinstance(enabled_systems, list):
+                    for system, enabled in zip(document.effect.particle_systems, enabled_systems):
+                        system.enabled = bool(enabled)
+                document.include_in_patch = bool(item.get("includeInPatch", False))
+                document.patch_entry_id = self._valid_patch_entry_id(item.get("patchEntryId"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             try:
                 root = ET.parse(path).getroot()
@@ -598,6 +716,7 @@ class ParticleController(QObject):
             return
         if self.current_document is not None:
             self._sort_documents(self.current_document)
+        self._project_path = path.resolve()
         if missing:
             QMessageBox.warning(
                 None,
@@ -605,12 +724,86 @@ class ParticleController(QObject):
                 "These files could not be found:\n\n" + "\n".join(missing[:10]),
             )
 
+    @staticmethod
+    def _legacy_archive_item(value: str) -> dict | None:
+        match = re.search(r"(?i)([0-9a-f]{16}) \[(\d+)\]\.particles$", value)
+        if match is None:
+            return None
+        return {
+            "type": "archive_particle",
+            "archiveSource": "slim",
+            "archiveId": match.group(1).lower(),
+            "entryId": match.group(2),
+        }
+
+    @staticmethod
+    def _archive_state_key(item: dict) -> str:
+        source = item.get("archiveSource", "slim")
+        archive = item.get("archiveId", "") if source == "slim" else item.get("archivePath", "")
+        return f"archive:{source}:{archive}:{item.get('entryId', '')}"
+
+    def _open_project_archive_particle(
+        self,
+        item: dict,
+        note: str,
+        group: str,
+        project_path: Path,
+        archive_cache: dict[tuple[str, str], ArchiveReader],
+    ) -> tuple[Document | None, str | None]:
+        source = item.get("archiveSource", "slim")
+        entry_value = item.get("entryId")
+        try:
+            entry_id = int(str(entry_value))
+        except (TypeError, ValueError):
+            return None, f"Invalid archive particle entry: {entry_value}"
+
+        if source == "slim":
+            archive_id = str(item.get("archiveId", "")).lower().removeprefix("0x")
+            if not re.fullmatch(r"[0-9a-f]{16}", archive_id):
+                return None, f"Invalid Slim archive ID: {archive_id or '(empty)'}"
+            if self._game_data_directory is None:
+                return None, f"Archive {archive_id} requires a Helldivers 2 Data folder."
+            cache_key = (source, archive_id)
+            try:
+                archive = archive_cache.get(cache_key)
+                if archive is None:
+                    archive = ArchiveReader.open_slim(self._game_data_directory, archive_id)
+                    archive_cache[cache_key] = archive
+            except (OSError, ArchiveError) as error:
+                return None, f"Archive {archive_id}: {error}"
+        elif source == "file":
+            archive_value = str(item.get("archivePath", ""))
+            archive_path = Path(archive_value)
+            if not archive_path.is_absolute():
+                archive_path = project_path.parent / archive_path
+            archive_path = archive_path.resolve()
+            if not archive_path.is_file():
+                return None, str(archive_path)
+            cache_key = (source, str(archive_path))
+            try:
+                archive = archive_cache.get(cache_key)
+                if archive is None:
+                    archive = ArchiveReader.open(archive_path)
+                    archive_cache[cache_key] = archive
+            except (OSError, ArchiveError) as error:
+                return None, f"Archive {archive_path.name}: {error}"
+        else:
+            return None, f"Unsupported archive source: {source}"
+
+        entry = archive.get_entry(entry_id, PARTICLE_TYPE_ID)
+        if entry is None:
+            return None, f"Archive {archive.path.name} does not contain particle {entry_id}."
+        document = self._open_archive_particle_from(archive, entry, group, select=True)
+        return document, None
+
     @Slot()
     def saveCurrent(self) -> bool:
+        return self.saveParticle()
+
+    @Slot(result=bool)
+    def saveParticle(self) -> bool:
         document = self.current_document
-        if document is not None and document.archive is not None:
-            return self._stage_archive_document(document)
-        return self._save_document(document) if document else False
+        return self._save_document(document) if document is not None and document.archive is None else False
 
     @Slot()
     def saveCurrentAs(self) -> bool:
@@ -632,15 +825,21 @@ class ParticleController(QObject):
     def saveAll(self) -> bool:
         success = True
         for document in self.documents_model.documents:
-            if not document.undo_stack.isClean():
-                if document.archive is not None:
-                    success = self._stage_archive_document(document) and success
-                else:
-                    success = self._save_document(document) and success
+            if document.archive is None and not document.undo_stack.isClean():
+                success = self._save_document(document) and success
         return success
 
     @Slot()
     def saveProject(self) -> None:
+        if not self.documents_model.documents:
+            return
+        if self._project_path is not None:
+            self._write_project(self._project_path)
+            return
+        self.saveProjectAs()
+
+    @Slot()
+    def saveProjectAs(self) -> None:
         if not self.documents_model.documents:
             return
         path, _ = QFileDialog.getSaveFileName(
@@ -648,16 +847,49 @@ class ParticleController(QObject):
         )
         if not path:
             return
-        output_path = Path(path)
+        self._write_project(Path(path))
+
+    def _write_project(self, output_path: Path) -> None:
         ungrouped_files = []
         grouped_files: dict[str, list[dict]] = {}
         selection_states = {}
         for document in self.documents_model.documents:
-            try:
-                stored_path = os.path.relpath(document.path, output_path.parent)
-            except ValueError:
-                stored_path = str(document.path)
-            file_item = {"type": "file", "filepath": stored_path, "note": document.note}
+            if document.archive is not None and document.archive_entry_id is not None:
+                if document.archive._slim_store is not None:
+                    file_item = {
+                        "type": "archive_particle",
+                        "archiveSource": "slim",
+                        "archiveId": document.archive.path.name,
+                        "entryId": str(document.archive_entry_id),
+                        "note": document.note,
+                        "includeInPatch": document.include_in_patch,
+                    }
+                else:
+                    try:
+                        stored_archive_path = os.path.relpath(document.archive.path, output_path.parent)
+                    except ValueError:
+                        stored_archive_path = str(document.archive.path)
+                    file_item = {
+                        "type": "archive_particle",
+                        "archiveSource": "file",
+                        "archivePath": stored_archive_path,
+                        "entryId": str(document.archive_entry_id),
+                        "note": document.note,
+                        "includeInPatch": document.include_in_patch,
+                    }
+                stored_path = self._archive_state_key(file_item)
+            else:
+                try:
+                    stored_path = os.path.relpath(document.path, output_path.parent)
+                except ValueError:
+                    stored_path = str(document.path)
+                file_item = {
+                    "type": "file",
+                    "filepath": stored_path,
+                    "note": document.note,
+                    "includeInPatch": document.include_in_patch,
+                    "patchEntryId": str(document.patch_entry_id) if document.patch_entry_id is not None else "",
+                }
             if document.group:
                 grouped_files.setdefault(document.group, []).append(file_item)
             else:
@@ -665,6 +897,7 @@ class ParticleController(QObject):
             selection_states[stored_path] = {
                 "selection": document.selections.get("color", []),
                 "presets": document.color_presets,
+                "enabledSystems": [system.enabled for system in document.effect.particle_systems],
             }
         structure = ungrouped_files + [
             {"type": "group", "name": name, "children": files}
@@ -680,6 +913,7 @@ class ParticleController(QObject):
             output_path.write_text(
                 json.dumps(project_data, indent=2, ensure_ascii=False), encoding="utf-8"
             )
+            self._project_path = output_path.resolve()
             self._set_status(f"Saved project {output_path.name}")
         except OSError as error:
             self._show_error("Unable to save project", str(error))
@@ -691,7 +925,7 @@ class ParticleController(QObject):
                 yield from ParticleController._flatten_project_structure(
                     item.get("children", []), item.get("name", "")
                 )
-            elif item.get("type") == "file":
+            elif item.get("type") in {"file", "archive_particle"}:
                 file_item = dict(item)
                 file_item["_group"] = group
                 yield file_item
@@ -711,7 +945,6 @@ class ParticleController(QObject):
                 temporary_path = Path(temporary.name)
             os.replace(temporary_path, target)
             document.path = target
-            document.effect.original_data = output
             document.undo_stack.setClean()
             self.documents_model.refresh(self.documents_model.documents.index(document))
             self.currentDocumentChanged.emit()
@@ -733,20 +966,92 @@ class ParticleController(QObject):
         try:
             output = document.effect.to_bytes()
             document.archive.stage(entry.with_data(output, entry.gpu_data, entry.stream_data))
-            document.effect.original_data = output
-            document.undo_stack.setClean()
             self.documents_model.refresh(self.documents_model.documents.index(document))
-            self._refresh_assets()
             self._set_status(f"Staged archive particle {document.archive_entry_id}")
             return True
         except (ArchiveError, ValueError) as error:
             self._show_error("Unable to stage particle", str(error))
             return False
 
+    def _patch_archive(self) -> ArchiveReader | None:
+        document = self.current_document
+        return document.archive if document is not None and document.archive is not None else self._archive
+
+    def _archives_for_patch(self) -> list[ArchiveReader]:
+        archives = []
+        for archive in [self._archive, *(document.archive for document in self.documents_model.documents)]:
+            if archive is not None and not any(archive is existing for existing in archives):
+                archives.append(archive)
+        return archives
+
+    @staticmethod
+    def _valid_patch_entry_id(value) -> int | None:
+        try:
+            entry_id = int(str(value), 0)
+        except (TypeError, ValueError):
+            return None
+        return entry_id if 0 <= entry_id <= 0xFFFFFFFFFFFFFFFF else None
+
+    @staticmethod
+    def _patch_entry_id_from_path(path: Path) -> int | None:
+        return ParticleController._valid_patch_entry_id(path.stem)
+
+    @Slot(int)
+    def togglePatchInclude(self, index: int) -> None:
+        if not 0 <= index < len(self.documents_model.documents):
+            return
+        document = self.documents_model.documents[index]
+        if document.archive is None and document.patch_entry_id is None:
+            document.patch_entry_id = self._patch_entry_id_from_path(document.path)
+            if document.patch_entry_id is None:
+                value, accepted = QInputDialog.getText(
+                    None,
+                    "Particle patch ID",
+                    "Particle File ID:",
+                )
+                if not accepted:
+                    return
+                document.patch_entry_id = self._valid_patch_entry_id(value)
+                if document.patch_entry_id is None:
+                    self._show_error("Invalid particle ID", "Enter a 64-bit decimal or 0x hexadecimal File ID.")
+                    return
+        document.include_in_patch = not document.include_in_patch
+        if not document.include_in_patch and document.archive is not None and document.archive_entry_id is not None:
+            document.archive.staged_entries.pop((document.archive_entry_id, PARTICLE_TYPE_ID), None)
+        self._mark_selected_patch_for_write()
+        self.documents_model.refresh(index)
+        self.stateChanged.emit()
+
+    @Slot(int)
+    def resetDocument(self, index: int) -> None:
+        if not 0 <= index < len(self.documents_model.documents):
+            return
+        document = self.documents_model.documents[index]
+        try:
+            document.effect = ParticleEffect.from_bytes(document.source_data)
+        except ParticleParseError as error:
+            self._show_error("Unable to reset particle", str(error))
+            return
+        document.undo_stack.clear()
+        document.undo_stack.setClean()
+        document.selections = {"color": [], "opacity": [], "intensity": []}
+        document.color_presets = [None, None]
+        self._reset_document_texture_replacements(document)
+        if document.archive is not None and document.archive_entry_id is not None:
+            document.archive.staged_entries.pop((document.archive_entry_id, PARTICLE_TYPE_ID), None)
+        self._mark_selected_patch_for_write()
+        self.documents_model.refresh(index)
+        if index == self._current_index:
+            self._current_index = -2
+            self.setCurrentDocument(index)
+        self.stateChanged.emit()
+        self._set_status(f"Reset {document.title or document.path.name}")
+
     @Slot(int)
     def selectTexture(self, row: int) -> None:
         self._selected_texture_index = row if 0 <= row < self.texture_bindings_model.rowCount() else -1
         self._texture_preview_url = ""
+        self._texture_original_preview_url = ""
         self._texture_preview_request += 1
         request_id = self._texture_preview_request
         if self._selected_texture_index < 0:
@@ -767,13 +1072,16 @@ class ParticleController(QObject):
         self._texture_preview_pool.start(task)
         self.stateChanged.emit()
 
-    @Slot(int, object, str, str)
-    def _finish_texture_preview(self, request_id: int, binding, preview_url: str, message: str) -> None:
+    @Slot(int, object, str, str, str)
+    def _finish_texture_preview(
+        self, request_id: int, binding, preview_url: str, original_preview_url: str, message: str
+    ) -> None:
         if request_id != self._texture_preview_request:
             return
         if binding.available:
             self._update_texture_binding(binding)
         self._texture_preview_url = preview_url
+        self._texture_original_preview_url = original_preview_url
         self._texture_preview_message = message
         self.stateChanged.emit()
 
@@ -787,6 +1095,8 @@ class ParticleController(QObject):
         )
         self._selected_texture_material = self._texture_material_ids[0] if self._texture_material_ids else -1
         self._apply_texture_filter()
+        if not self._texture_list_view and self.texture_bindings_model.rowCount() > 0:
+            self.selectTexture(0)
 
     @Slot(int)
     def selectTextureMaterial(self, option_index: int) -> None:
@@ -799,12 +1109,29 @@ class ParticleController(QObject):
     def setTextureListView(self, enabled: bool) -> None:
         if self._texture_list_view == enabled:
             return
+        selected_binding = self._selected_texture_binding()
         self._texture_list_view = enabled
         self._texture_overview_request += 1
         self._texture_overview_pool.clear()
+        if not enabled and selected_binding is not None:
+            self._selected_texture_system = selected_binding.system_index
+            self._texture_material_ids = self._texture_materials_by_system.get(
+                selected_binding.system_index, []
+            )
+            self._selected_texture_material = selected_binding.material_id
         self._apply_texture_filter()
         if enabled:
             self._queue_texture_overview_previews()
+        elif selected_binding is not None:
+            for row in range(self.texture_bindings_model.rowCount()):
+                binding = self.texture_bindings_model.binding_at(row)
+                if (binding.system_index, binding.material_id, binding.texture_id) == (
+                    selected_binding.system_index,
+                    selected_binding.material_id,
+                    selected_binding.texture_id,
+                ):
+                    self.selectTexture(row)
+                    break
 
     @Slot(int, str, str)
     def selectTextureBinding(self, system_index: int, material_id: str, texture_id: str) -> None:
@@ -821,6 +1148,7 @@ class ParticleController(QObject):
     @Slot()
     def importSelectedTexturePng(self) -> None:
         texture_id = self._selected_texture_id()
+        binding = self._selected_texture_binding()
         document = self.current_document
         archive = document.archive if document is not None else None
         if texture_id is None or archive is None:
@@ -830,7 +1158,11 @@ class ParticleController(QObject):
             return
         try:
             archive.replace_texture_from_png(texture_id, Path(path))
-            self._refresh_assets()
+            document.modified_texture_ids.add(texture_id)
+            self._texture_patch_choices[(id(archive), texture_id)] = True
+            self.documents_model.refresh(self.documents_model.documents.index(document))
+            self._mark_selected_patch_for_write()
+            self._reload_selected_texture()
             self._set_status(f"Staged PNG replacement for texture {texture_id}")
         except ArchiveError as error:
             self._show_error("Unable to import PNG texture", str(error))
@@ -838,6 +1170,7 @@ class ParticleController(QObject):
     @Slot()
     def importSelectedTextureDds(self) -> None:
         texture_id = self._selected_texture_id()
+        binding = self._selected_texture_binding()
         document = self.current_document
         archive = document.archive if document is not None else None
         if texture_id is None or archive is None:
@@ -847,30 +1180,283 @@ class ParticleController(QObject):
             return
         try:
             archive.replace_texture_from_dds(texture_id, Path(path).read_bytes())
-            self._refresh_assets()
+            document.modified_texture_ids.add(texture_id)
+            self._texture_patch_choices[(id(archive), texture_id)] = True
+            self.documents_model.refresh(self.documents_model.documents.index(document))
+            self._mark_selected_patch_for_write()
+            self._reload_selected_texture()
             self._set_status(f"Staged DDS replacement for texture {texture_id}")
         except (OSError, ArchiveError) as error:
             self._show_error("Unable to import DDS texture", str(error))
 
     @Slot()
-    def writePatch(self) -> None:
-        if self._archive is None or not self._archive.staged_entries:
+    def resetSelectedTexture(self) -> None:
+        binding = self._selected_texture_binding()
+        if binding is None:
             return
-        default_path = str(self._archive.path.with_name(self._archive.path.name + ".patch_0"))
-        path, _ = QFileDialog.getSaveFileName(None, "Write PM patch", default_path, "Patch files (*)")
+        key = (binding.texture_id, TEXTURE_TYPE_ID)
+        reset = False
+        for archive in self._archives_for_patch():
+            reset = archive.staged_entries.pop(key, None) is not None or reset
+        if not reset:
+            return
+        self._clear_texture_replacement_tracking(binding.texture_id)
+        self._mark_selected_patch_for_write()
+        self._reload_selected_texture()
+        self._set_status(f"Reset texture {binding.texture_id}")
+
+    @Slot(bool)
+    def setSelectedTexturePatchVersion(self, use_imported: bool) -> None:
+        binding = self._selected_texture_binding()
+        document = self.current_document
+        if binding is None or document is None or document.archive is None:
+            return
+        key = (id(document.archive), binding.texture_id)
+        if self._texture_patch_choices.get(key, True) == use_imported:
+            return
+        self._texture_patch_choices[key] = use_imported
+        self._mark_selected_patch_for_write()
+        self.stateChanged.emit()
+
+    @Slot(int)
+    def toggleParticleSystem(self, system_index: int) -> None:
+        document = self.current_document
+        if document is None:
+            return
+        system = next(
+            (item for item in document.effect.particle_systems if item.index == system_index), None
+        )
+        if system is None:
+            return
+        old_value = system.enabled
+
+        def apply(enabled):
+            system.enabled = enabled
+            self.visualizer_model.refresh_system(system.index)
+            self._refresh_assets()
+            self._document_state_changed(document)
+
+        self._push_edit(
+            f"{'Enable' if not old_value else 'Disable'} particle system {system.index + 1}",
+            apply,
+            old_value,
+            not old_value,
+        )
+
+    def _restore_texture_binding(self, binding) -> None:
+        if binding is None:
+            return
+        try:
+            system_option = self._texture_system_indices.index(binding.system_index)
+            self.selectTextureSystem(system_option)
+            material_option = self._texture_material_ids.index(binding.material_id)
+            self.selectTextureMaterial(material_option)
+        except ValueError:
+            return
+        for row in range(self.texture_bindings_model.rowCount()):
+            candidate = self.texture_bindings_model.binding_at(row)
+            if candidate.texture_id == binding.texture_id:
+                self.selectTexture(row)
+                return
+
+    def _reload_selected_texture(self) -> None:
+        if self._selected_texture_index >= 0:
+            self.selectTexture(self._selected_texture_index)
+        else:
+            self.stateChanged.emit()
+
+    def _clear_texture_replacement_tracking(self, texture_id: int) -> None:
+        for document in self.documents_model.documents:
+            if texture_id in document.modified_texture_ids:
+                document.modified_texture_ids.discard(texture_id)
+                self.documents_model.refresh(self.documents_model.documents.index(document))
+            if document.archive is not None:
+                self._texture_patch_choices.pop((id(document.archive), texture_id), None)
+
+    def _reset_document_texture_replacements(self, document: Document) -> None:
+        for texture_id in tuple(document.modified_texture_ids):
+            for archive in self._archives_for_patch():
+                archive.staged_entries.pop((texture_id, TEXTURE_TYPE_ID), None)
+            self._clear_texture_replacement_tracking(texture_id)
+
+    @Slot()
+    def exportSelectedTextureDds(self) -> None:
+        texture_id, entry = self._selected_texture_entry()
+        if texture_id is None or entry is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            None,
+            "Export texture as DDS",
+            f"{texture_id}.dds",
+            "DDS files (*.dds)",
+        )
         if not path:
             return
         try:
-            output = self._archive.write_patch(path)
+            Path(path).write_bytes(parse_texture(entry).dds)
+            self._set_status(f"Exported texture {texture_id} as DDS")
+        except (OSError, ArchiveError) as error:
+            self._show_error("Unable to export DDS texture", str(error))
+
+    @Slot()
+    def exportSelectedTexturePng(self) -> None:
+        texture_id, entry = self._selected_texture_entry()
+        if texture_id is None or entry is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            None,
+            "Export texture as PNG",
+            f"{texture_id}.png",
+            "PNG files (*.png)",
+        )
+        if not path:
+            return
+        try:
+            info = parse_texture(entry)
+            cache_directory = Path(tempfile.gettempdir()) / "pm-particlemodder" / "texture-exports"
+            preview = dds_to_png(
+                preview_dds(info), cache_directory,
+                f"{texture_id}-export-{zlib.crc32(info.dds):08x}",
+            )
+            Path(path).write_bytes(preview.read_bytes())
+            self._set_status(f"Exported texture {texture_id} as PNG")
+        except (OSError, ArchiveError) as error:
+            self._show_error("Unable to export PNG texture", str(error))
+
+    @Slot()
+    def writePatch(self) -> None:
+        if not self.hasSelectedPatch:
+            self._show_error("No patch selected", "Create a patch from the active archive first.")
+            return
+        target = self._patch_targets[self._selected_patch_index]
+        archive = target.archive
+        entries: dict[tuple[int, int], ArchiveEntry] = {}
+        for document in self.documents_model.documents:
+            if not document.include_in_patch:
+                continue
+            if document.archive is not None:
+                if not self._stage_archive_document(document):
+                    return
+                entries[(document.archive_entry_id, PARTICLE_TYPE_ID)] = document.archive.staged_entries[
+                    (document.archive_entry_id, PARTICLE_TYPE_ID)
+                ]
+            elif document.patch_entry_id is not None:
+                entries[(document.patch_entry_id, PARTICLE_TYPE_ID)] = self._standalone_particle_entry(document)
+
+        for source_archive in self._archives_for_patch():
+            for key, entry in source_archive.staged_entries.items():
+                if entry.type_id != PARTICLE_TYPE_ID and self._should_write_staged_entry(source_archive, entry):
+                    entries[key] = entry
+        if not entries and not target.needs_write:
+            return
+        try:
+            output = (
+                archive.write_patch(target.path, list(entries.values()))
+                if entries else self._write_empty_patch(target.path)
+            )
+            target.needs_write = False
             self._set_status(f"Wrote patch {output.name}")
+            self.stateChanged.emit()
         except (OSError, ArchiveError) as error:
             self._show_error("Unable to write patch", str(error))
 
+    @Slot()
+    def createPatch(self) -> None:
+        archive = self._patch_archive()
+        if archive is None:
+            self._show_error("No archive loaded", "Load an archive before creating a patch.")
+            return
+        patch_directory = self._game_data_directory or archive.path.parent
+        target_path = self._next_patch_path(patch_directory)
+        target = PatchTarget(target_path, target_path.name, archive)
+        self._patch_targets.append(target)
+        self._selected_patch_index = len(self._patch_targets) - 1
+        self._set_status(f"Created patch {target.path.name}")
+        self.stateChanged.emit()
+
+    @Slot(int)
+    def selectPatch(self, index: int) -> None:
+        if not 0 <= index < len(self._patch_targets):
+            return
+        self._selected_patch_index = index
+        self.stateChanged.emit()
+
+    @Slot()
+    def renameSelectedPatch(self) -> None:
+        if not self.hasSelectedPatch:
+            return
+        current = self._patch_targets[self._selected_patch_index]
+        name, accepted = QInputDialog.getText(None, "Rename patch", "Patch name:", text=current.name)
+        if not accepted:
+            return
+        normalized = name.strip()
+        if not normalized or normalized == current.name:
+            return
+        if Path(normalized).name != normalized or any(character in normalized for character in '<>:"/\\|?*'):
+            self._show_error("Invalid patch name", "Use a file name only, without path characters.")
+            return
+        current.name = normalized
+        current.path = current.path.with_name(normalized)
+        self._set_status(f"Renamed patch to {normalized}")
+        self.stateChanged.emit()
+
+    def _next_patch_path(self, directory: Path) -> Path:
+        target = directory / f"{self.BASE_PATCH_ARCHIVE_ID}.patch_{self._next_patch_number}"
+        self._next_patch_number += 1
+        return target
+
+    @staticmethod
+    def _write_empty_patch(path: Path) -> Path:
+        output = path.expanduser().resolve()
+        write_patch_archive(output, [])
+        return output
+
+    def _mark_selected_patch_for_write(self) -> None:
+        if self.hasSelectedPatch:
+            self._patch_targets[self._selected_patch_index].needs_write = True
+
+    def _should_write_staged_entry(self, archive: ArchiveReader, entry: ArchiveEntry) -> bool:
+        return (
+            entry.type_id != TEXTURE_TYPE_ID
+            or self._texture_patch_choices.get((id(archive), entry.file_id), True)
+        )
+
+    @staticmethod
+    def _standalone_particle_entry(document: Document) -> ArchiveEntry:
+        return ArchiveEntry(
+            file_id=document.patch_entry_id,
+            type_id=PARTICLE_TYPE_ID,
+            toc_offset=0,
+            stream_offset=0,
+            gpu_offset=0,
+            unknown1=0,
+            unknown2=0,
+            toc_size=0,
+            stream_size=0,
+            gpu_size=0,
+            unknown3=16,
+            unknown4=64,
+            index=0,
+            toc_data=document.effect.to_bytes(),
+            gpu_data=b"",
+            stream_data=b"",
+        )
+
     def _selected_texture_id(self):
+        texture_id, _entry = self._selected_texture_entry()
+        return texture_id
+
+    def _selected_texture_entry(self):
         binding = self._selected_texture_binding()
-        if binding is None:
-            return None
-        return binding.texture_id if binding.available else None
+        document = self.current_document
+        archive = document.archive if document is not None else None
+        if binding is None or archive is None:
+            return None, None
+        try:
+            entry = archive.find_entry(binding.texture_id, TEXTURE_TYPE_ID)
+        except ArchiveError:
+            return None, None
+        return (binding.texture_id, entry) if entry is not None else (None, None)
 
     def _selected_texture_binding(self):
         if not 0 <= self._selected_texture_index < self.texture_bindings_model.rowCount():
@@ -896,12 +1482,16 @@ class ParticleController(QObject):
                 self._selected_texture_system, []
             )
             self._selected_texture_material = self._texture_material_ids[0] if self._texture_material_ids else -1
+            self.texture_overview_model.set_bindings(
+                self._all_texture_bindings, self._texture_system_indices
+            )
         else:
             self.asset_links_model.set_links([])
             self._all_texture_bindings = []
             self._texture_system_indices = []
             self._texture_material_ids = []
             self._texture_materials_by_system = {}
+            self.texture_overview_model.set_bindings([], [])
             self._selected_texture_system = -1
             self._selected_texture_material = -1
         self._selected_asset_index = -1
@@ -925,6 +1515,7 @@ class ParticleController(QObject):
         ]
         self._all_texture_bindings = pending
         self.texture_bindings_model.set_bindings(pending)
+        self.texture_overview_model.set_bindings(pending, self._texture_system_indices)
         for binding in pending:
             if binding.preview_state != "loading":
                 continue
@@ -953,6 +1544,7 @@ class ParticleController(QObject):
             ):
                 self.texture_bindings_model.update_binding(row, binding)
                 break
+        self.texture_overview_model.update_binding(binding)
 
     def _apply_texture_filter(self, emit_state: bool = True) -> None:
         self._texture_preview_request += 1
@@ -965,6 +1557,7 @@ class ParticleController(QObject):
         ])
         self._selected_texture_index = -1
         self._texture_preview_url = ""
+        self._texture_original_preview_url = ""
         self._texture_preview_message = "Select a texture to preview it."
         if emit_state:
             self.stateChanged.emit()
@@ -1258,7 +1851,69 @@ class ParticleController(QObject):
         )
         if not selected.isValid():
             return ""
+        self._remember_custom_picker_color(selected)
         return f"{selected.red()}, {selected.green()}, {selected.blue()}"
+
+    @staticmethod
+    def _default_settings_path() -> Path:
+        location = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.AppConfigLocation
+        )
+        return Path(location) / "preferences.json"
+
+    def _load_preferences(self) -> None:
+        try:
+            data = json.loads(self._settings_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            data = {}
+
+        game_data_path = data.get("gameDataDirectory")
+        if isinstance(game_data_path, str):
+            candidate = Path(game_data_path).expanduser()
+            if (candidate / "bundles.nxa").is_file():
+                self._game_data_directory = candidate.resolve()
+
+        colors = data.get("customPickerColors", [])
+        if isinstance(colors, list):
+            self._custom_picker_colors = self._valid_picker_colors(colors)
+            self._apply_custom_picker_colors()
+
+    def _save_preferences(self) -> None:
+        data = {
+            "gameDataDirectory": str(self._game_data_directory) if self._game_data_directory else "",
+            "customPickerColors": self._custom_picker_colors,
+        }
+        try:
+            self._settings_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._settings_path.with_suffix(self._settings_path.suffix + ".tmp")
+            temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            temporary.replace(self._settings_path)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _valid_picker_colors(colors) -> list[str]:
+        maximum = QColorDialog.customCount()
+        valid = []
+        for value in colors:
+            color = QColor(str(value))
+            if color.isValid() and color.name() not in valid:
+                valid.append(color.name())
+            if len(valid) >= maximum:
+                break
+        return valid
+
+    def _apply_custom_picker_colors(self) -> None:
+        for index, value in enumerate(self._custom_picker_colors):
+            QColorDialog.setCustomColor(index, QColor(value).rgb())
+
+    def _remember_custom_picker_color(self, color: QColor) -> None:
+        value = color.name()
+        self._custom_picker_colors = self._valid_picker_colors(
+            [value] + self._custom_picker_colors
+        )
+        self._apply_custom_picker_colors()
+        self._save_preferences()
 
     @Slot(str, "QVariantList")
     def updateSelection(self, kind: str, selection) -> None:
@@ -1391,6 +2046,8 @@ class ParticleController(QObject):
             self.visualizer_model.refresh(row)
             return
         visualizer = self.visualizer_model.visualizer_at(row)
+        if visualizer is None:
+            return
         old_value = getattr(visualizer, attribute)
         if old_value is None or old_value == value:
             return

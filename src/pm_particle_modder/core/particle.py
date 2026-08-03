@@ -141,6 +141,7 @@ class ParticleSystem:
     scale_graphs: list[Graph] = field(default_factory=list)
     opacity_graphs: list[Graph] = field(default_factory=list)
     color_graphs: list[ColorGraph] = field(default_factory=list)
+    enabled: bool = True
 
     @property
     def is_rendering(self) -> bool:
@@ -206,6 +207,13 @@ class ParticleEffect:
                 graph.write_into(output)
             for graph in system.color_graphs:
                 graph.write_into(output)
+
+        for system in self.particle_systems:
+            if not system.enabled:
+                # Stingray uses unk3 at +0x4C to mark a non-rendering particle system.
+                # Keeping its block and index intact avoids breaking systems that are
+                # referenced by trails or other runtime data later in the effect.
+                struct.pack_into("<I", output, system.offset + 76, 0xFFFFFFFF)
         return bytes(output)
 
 

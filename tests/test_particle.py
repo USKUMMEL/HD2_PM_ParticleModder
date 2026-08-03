@@ -42,6 +42,13 @@ def make_particle() -> bytes:
     return bytes(header + system)
 
 
+def make_two_system_particle() -> bytes:
+    source = bytearray(make_particle())
+    struct.pack_into("<I", source, 24, 2)
+    source.extend(source[80:])
+    return bytes(source)
+
+
 class ParticleEffectTests(unittest.TestCase):
     def test_unchanged_file_round_trips_byte_for_byte(self):
         source = make_particle()
@@ -70,6 +77,18 @@ class ParticleEffectTests(unittest.TestCase):
         changed = {index for index, pair in enumerate(zip(source, output)) if pair[0] != pair[1]}
         self.assertTrue(changed)
         self.assertTrue(changed.issubset(allowed))
+
+    def test_disabled_systems_are_serialized_as_non_rendering(self):
+        source = make_two_system_particle()
+        effect = ParticleEffect.from_bytes(source)
+        self.assertEqual(len(effect.particle_systems), 2)
+        effect.particle_systems[0].enabled = False
+
+        output = effect.to_bytes()
+
+        self.assertEqual(struct.unpack_from("<I", output, 24)[0], 2)
+        self.assertEqual(struct.unpack_from("<I", output, 80 + 76)[0], 0xFFFFFFFF)
+        self.assertEqual(len(ParticleEffect.from_bytes(output).particle_systems), 2)
 
     def test_rejects_unsupported_version(self):
         with self.assertRaisesRegex(ParticleParseError, "Unsupported particle version"):

@@ -4,6 +4,7 @@ import QtQuick.Controls.Basic
 Button {
     id: control
     property bool accent: false
+    property bool warning: false
     property string tooltip: ""
     implicitHeight: 34
     implicitWidth: Math.max(72, contentItem.implicitWidth + 24)
@@ -14,6 +15,7 @@ Button {
     contentItem: Text {
         text: control.text
         color: !control.enabled ? Theme.textMuted
+              : control.warning ? Theme.danger
               : control.accent ? Theme.accentText : Theme.text
         font.pixelSize: 13
         font.weight: control.accent ? Font.DemiBold : Font.Medium
@@ -30,6 +32,7 @@ Button {
              : control.hovered ? Theme.surfaceHover : Theme.surfaceRaised
         border.width: control.visualFocus ? 2 : 1
         border.color: control.visualFocus ? Theme.focus
+                    : control.warning ? Theme.danger
                     : control.accent ? Theme.accentStrong : Theme.border
     }
 
@@ -37,4 +40,3 @@ Button {
     ToolTip.text: tooltip
     ToolTip.delay: 500
 }
-

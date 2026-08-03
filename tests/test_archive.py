@@ -15,6 +15,7 @@ from pm_particle_modder.core import (
     SlimArchiveStore,
     parse_material,
     parse_texture,
+    preview_dds,
     parse_unit_material_ids,
 )
 from pm_particle_modder.core.archive import write_patch_archive
@@ -76,7 +77,7 @@ class ArchiveTests(unittest.TestCase):
         material = bytearray(160)
         struct.pack_into("<Q", material, 24, 77)
         struct.pack_into("<I", material, 64, 2)
-        struct.pack_into("<IQ", material, 136, 2, TEXTURE_ID)
+        struct.pack_into("<IIQ", material, 136, 2, 0, TEXTURE_ID)
         info = parse_material(bytes(material))
         self.assertEqual(info.parent_material_id, 77)
         self.assertEqual(info.texture_ids, (TEXTURE_ID,))
@@ -87,6 +88,17 @@ class ArchiveTests(unittest.TestCase):
         struct.pack_into("<I", unit, 120, 42)
         struct.pack_into("<Q", unit, 124, MATERIAL_ID)
         self.assertEqual(parse_unit_material_ids(bytes(unit)), (MATERIAL_ID,))
+
+    def test_preview_dds_uses_the_first_texture_array_slice(self):
+        raw = b"first-slice!second-slice"
+        dds = bytearray(make_dds(raw))
+        struct.pack_into("<I", dds, 140, 2)
+        texture = entry(TEXTURE_ID, TEXTURE_TYPE_ID, bytes(192) + bytes(dds[:148]), bytes(dds[148:]))
+
+        preview = preview_dds(parse_texture(texture))
+
+        self.assertEqual(struct.unpack_from("<I", preview, 140)[0], 1)
+        self.assertEqual(preview[148:], b"first-slice!")
 
     def test_archive_links_texture_replacement_and_patch_round_trip(self):
         material = bytearray(148)
@@ -121,6 +133,9 @@ class ArchiveTests(unittest.TestCase):
 
             replacement = make_dds(b"replacement")
             archive.replace_texture_from_dds(TEXTURE_ID, replacement)
+            self.assertEqual(
+                parse_texture(archive.source_entry(TEXTURE_ID, TEXTURE_TYPE_ID)).dds, dds
+            )
             patch_path = Path(directory) / "fixture_archive.patch_0"
             archive.write_patch(patch_path)
             patch = ArchiveReader.open(patch_path)
@@ -128,6 +143,20 @@ class ArchiveTests(unittest.TestCase):
             self.assertIsNotNone(patched_texture)
             self.assertEqual(parse_texture(patched_texture).dds, replacement)
             self.assertEqual(len(patch.entries), 1)
+
+    def test_standalone_archive_reads_sidecars_only_for_requested_resources(self):
+        dds = make_dds(b"lazy standalone gpu payload")
+        with tempfile.TemporaryDirectory() as directory:
+            archive_path = Path(directory) / "fixture_archive"
+            write_patch_archive(archive_path, [
+                entry(TEXTURE_ID, TEXTURE_TYPE_ID, bytes(192) + dds[:148], dds[148:]),
+            ])
+
+            archive = ArchiveReader.open(archive_path)
+
+            self.assertEqual(archive.gpu_data, b"")
+            self.assertEqual(archive.entries[0].gpu_data, b"")
+            self.assertEqual(parse_texture(archive.get_entry(TEXTURE_ID, TEXTURE_TYPE_ID)).dds, dds)
 
     def test_slim_store_reconstructs_archive_by_id(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -197,6 +226,9 @@ class ArchiveTests(unittest.TestCase):
             external = archive.find_entry(TEXTURE_ID, TEXTURE_TYPE_ID)
             self.assertIsNotNone(external)
             self.assertEqual((parse_texture(external).width, parse_texture(external).height), (16, 8))
+            self.assertEqual(
+                parse_texture(archive.reload_entry_full(TEXTURE_ID, TEXTURE_TYPE_ID)).width, 16
+            )
 
     def test_slim_store_loads_texture_sidecar_on_demand(self):
         with tempfile.TemporaryDirectory() as directory:
