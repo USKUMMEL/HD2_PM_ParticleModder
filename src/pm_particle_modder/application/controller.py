@@ -619,17 +619,33 @@ class ParticleController(QObject):
     def _load_archive_names(self) -> dict[str, str]:
         if self._archive_names is not None:
             return self._archive_names
+        cache_path = self._settings_path.parent / "archivehashes.json"
+        cached_names: dict[str, str] = {}
+        try:
+            cached_names = self._parse_archive_names(json.loads(cache_path.read_text(encoding="utf-8")))
+        except (OSError, ValueError, UnicodeDecodeError):
+            pass
         try:
             with urlopen(self.ARCHIVE_LIST_URL, timeout=8) as response:
                 raw_data = json.loads(response.read().decode("utf-8"))
-            self._archive_names = {
-                archive_id.lower(): f"{category_name}: {name}"
-                for category_name, category in raw_data.items()
-                for archive_id, name in category.items()
-            }
+            self._archive_names = self._parse_archive_names(raw_data)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps(raw_data, ensure_ascii=True), encoding="utf-8")
         except (OSError, ValueError, UnicodeDecodeError):
-            self._archive_names = {}
+            self._archive_names = cached_names
         return self._archive_names
+
+    @staticmethod
+    def _parse_archive_names(raw_data) -> dict[str, str]:
+        if not isinstance(raw_data, dict):
+            raise ValueError("Archive hash list is not an object.")
+        return {
+            archive_id.lower(): f"{category_name}: {name}"
+            for category_name, category in raw_data.items()
+            if isinstance(category_name, str) and isinstance(category, dict)
+            for archive_id, name in category.items()
+            if isinstance(archive_id, str) and isinstance(name, str)
+        }
 
     @Slot("QVariantList")
     def openUrls(self, urls) -> None:
