@@ -74,6 +74,15 @@ ApplicationWindow {
         collapsedParticleGroups = nextCollapsedGroups
     }
 
+    function openPatchRenameDialog() {
+        if (!controller.hasSelectedPatch)
+            return
+        patchNameInput.text = controller.selectedPatchName
+        patchRenameDialog.open()
+        patchNameInput.forceActiveFocus()
+        patchNameInput.selectAll()
+    }
+
     onClosing: function(close) {
         close.accepted = controller.requestExit()
     }
@@ -169,7 +178,7 @@ ApplicationWindow {
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
                     onClicked: patchMenu.popup(patchSelector, 0, patchSelector.height)
-                    onDoubleClicked: controller.renameSelectedPatch()
+                    onDoubleClicked: window.openPatchRenameDialog()
                 }
                 ToolTip.visible: patchSelectorMouse.containsMouse
                 ToolTip.text: controller.hasSelectedPatch ? "Click to select, double-click to rename" : "Select a patch target"
@@ -225,6 +234,44 @@ ApplicationWindow {
             font.pixelSize: 13
             wrapMode: Text.WordWrap
             padding: 18
+        }
+    }
+
+    Dialog {
+        id: patchRenameDialog
+        title: "Rename Patch"
+        modal: true
+        anchors.centerIn: parent
+        width: 420
+        padding: 16
+        standardButtons: Dialog.NoButton
+        background: Rectangle { color: Theme.surface; border.color: Theme.border; radius: 5 }
+
+        contentItem: ColumnLayout {
+            spacing: 12
+            Text { text: "Patch name"; color: Theme.textMuted; font.pixelSize: 11 }
+            PmTextField {
+                id: patchNameInput
+                Layout.fillWidth: true
+                onAccepted: {
+                    controller.renameSelectedPatchTo(text)
+                    patchRenameDialog.close()
+                }
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                PmButton { text: "Cancel"; onClicked: patchRenameDialog.close() }
+                PmButton {
+                    text: "Rename"
+                    accent: true
+                    enabled: patchNameInput.text.trim().length > 0
+                    onClicked: {
+                        controller.renameSelectedPatchTo(patchNameInput.text)
+                        patchRenameDialog.close()
+                    }
+                }
+            }
         }
     }
 

@@ -189,21 +189,35 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.controller.selectedTextureId, "202")
         self.assertEqual(self.controller.texture_bindings_model.rowCount(), 1)
 
-    def test_persists_game_data_folder_and_picker_colors(self):
+    def test_persists_preferences(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             data_folder = root / "data"
             data_folder.mkdir()
+            project_open_folder = root / "open-projects"
+            project_open_folder.mkdir()
+            project_save_folder = root / "save-projects"
+            project_save_folder.mkdir()
             (data_folder / "bundles.nxa").write_bytes(b"fixture")
             settings_path = root / "preferences.json"
             controller = ParticleController(settings_path=settings_path)
             controller._game_data_directory = data_folder
+            controller._last_project_open_directory = project_open_folder
+            controller._last_project_save_directory = project_save_folder
             controller._remember_custom_picker_color(QColor(12, 34, 56))
 
             restored = ParticleController(settings_path=settings_path)
 
             self.assertEqual(restored._game_data_directory, data_folder.resolve())
             self.assertEqual(restored._custom_picker_colors, ["#0c2238"])
+            self.assertEqual(restored._last_project_open_directory, project_open_folder.resolve())
+            self.assertEqual(restored._last_project_save_directory, project_save_folder.resolve())
+            with patch(
+                "pm_particle_modder.application.controller.QFileDialog.getOpenFileName",
+                return_value=("", ""),
+            ) as open_dialog:
+                restored.openProject()
+            self.assertEqual(open_dialog.call_args.args[2], str(project_open_folder.resolve()))
 
     def test_project_reopens_slim_archive_particles_by_id(self):
         archive_id = "2f1147605182c6ab"
@@ -421,11 +435,7 @@ class ControllerTests(unittest.TestCase):
             controller._archive = ArchiveReader.open(archive_path)
             controller.createPatch()
 
-            with patch(
-                "pm_particle_modder.application.controller.QInputDialog.getText",
-                return_value=("my_particle_patch", True),
-            ):
-                controller.renameSelectedPatch()
+            controller.renameSelectedPatchTo("my_particle_patch")
 
             self.assertEqual(controller.selectedPatchName, "my_particle_patch")
             self.assertEqual(controller._patch_targets[0].path.name, "my_particle_patch")

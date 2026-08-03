@@ -18,6 +18,8 @@ Item {
     property int dragLastRow: -1
     property int dragLastColumn: -1
     property bool additiveDrag: false
+    property bool subtractiveDrag: false
+    property var dragBaseline: ({})
     property bool dragSelecting: false
     property color applyColor: "#FFFFFF"
 
@@ -86,6 +88,39 @@ Item {
         )
     }
 
+    function restoreBaselineDifference(
+            sourceFirstRow, sourceLastRow, sourceFirstColumn, sourceLastColumn,
+            otherFirstRow, otherLastRow, otherFirstColumn, otherLastColumn) {
+        const overlapFirstRow = Math.max(sourceFirstRow, otherFirstRow)
+        const overlapLastRow = Math.min(sourceLastRow, otherLastRow)
+        const overlapFirstColumn = Math.max(sourceFirstColumn, otherFirstColumn)
+        const overlapLastColumn = Math.min(sourceLastColumn, otherLastColumn)
+
+        function restoreRectangle(firstRow, lastRow, firstColumn, lastColumn) {
+            for (let row = firstRow; row <= lastRow; ++row) {
+                for (let column = firstColumn; column <= lastColumn; ++column) {
+                    const index = root.tableModel.cellIndex(row, column)
+                    const key = row + ":" + column
+                    cellSelection.select(
+                        index,
+                        root.dragBaseline[key]
+                            ? ItemSelectionModel.Select
+                            : ItemSelectionModel.Deselect
+                    )
+                }
+            }
+        }
+
+        if (overlapFirstRow > overlapLastRow || overlapFirstColumn > overlapLastColumn) {
+            restoreRectangle(sourceFirstRow, sourceLastRow, sourceFirstColumn, sourceLastColumn)
+            return
+        }
+        restoreRectangle(sourceFirstRow, overlapFirstRow - 1, sourceFirstColumn, sourceLastColumn)
+        restoreRectangle(overlapLastRow + 1, sourceLastRow, sourceFirstColumn, sourceLastColumn)
+        restoreRectangle(overlapFirstRow, overlapLastRow, sourceFirstColumn, overlapFirstColumn - 1)
+        restoreRectangle(overlapFirstRow, overlapLastRow, overlapLastColumn + 1, sourceLastColumn)
+    }
+
     function selectRange(endRow, endColumn) {
         if (endRow === root.dragLastRow && endColumn === root.dragLastColumn)
             return
@@ -103,17 +138,24 @@ Item {
                 previousFirstRow, previousLastRow, previousFirstColumn, previousLastColumn,
                 firstRow, lastRow, firstColumn, lastColumn, ItemSelectionModel.Deselect
             )
-        } else {
-            cellSelection.select(
-                root.tableModel.cellIndex(root.dragAnchorRow, root.dragAnchorColumn),
+            root.updateRectangleDifference(
+                firstRow, lastRow, firstColumn, lastColumn,
+                previousFirstRow, previousLastRow, previousFirstColumn, previousLastColumn,
                 ItemSelectionModel.Select
             )
+        } else {
+            root.updateRectangleDifference(
+                firstRow, lastRow, firstColumn, lastColumn,
+                previousFirstRow, previousLastRow, previousFirstColumn, previousLastColumn,
+                root.subtractiveDrag
+                    ? ItemSelectionModel.Deselect
+                    : ItemSelectionModel.Select
+            )
+            root.restoreBaselineDifference(
+                previousFirstRow, previousLastRow, previousFirstColumn, previousLastColumn,
+                firstRow, lastRow, firstColumn, lastColumn
+            )
         }
-        root.updateRectangleDifference(
-            firstRow, lastRow, firstColumn, lastColumn,
-            previousFirstRow, previousLastRow, previousFirstColumn, previousLastColumn,
-            ItemSelectionModel.Select
-        )
         root.dragLastRow = endRow
         root.dragLastColumn = endColumn
     }
@@ -276,8 +318,8 @@ Item {
                     id: colorPickerMouse
                     anchors.fill: parent
                     hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: {
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
                         const rgb = controller.pickApplyColor(colorValue.text)
                         const color = root.colorFromText(rgb)
                         if (color !== null)
@@ -318,7 +360,7 @@ Item {
             }
             Rectangle { Layout.preferredWidth: 1; Layout.fillHeight: true; Layout.topMargin: 4; Layout.bottomMargin: 4; color: Theme.border }
             Text {
-                text: "ALL TICKED PARTICLES " + controller.applyParticleCount
+                text: "ALL TICKED PARTICLES"
                 color: Theme.textMuted
                 font.pixelSize: 10
                 font.weight: Font.DemiBold
@@ -355,9 +397,10 @@ Item {
                 font.pixelSize: 10
                 font.weight: Font.DemiBold
             }
+            Item { Layout.fillWidth: true }
             PmButton {
                 text: "Select All"
-                enabled: root.tableModel.rowCount() > 0
+                enabled: controller.hasDocument
                 tooltip: "Select every cell in the current particle"
                 onClicked: controller.selectAllTableCells(root.kind)
             }
@@ -366,60 +409,6 @@ Item {
                 enabled: root.selectedCount > 0
                 tooltip: "Clear the current particle selection"
                 onClicked: controller.clearTableSelection(root.kind)
-            }
-            Rectangle { Layout.preferredWidth: 1; Layout.fillHeight: true; Layout.topMargin: 4; Layout.bottomMargin: 4; color: Theme.border }
-            Text {
-                text: "ALL LOADED PARTICLES"
-                color: Theme.textMuted
-                font.pixelSize: 10
-                font.weight: Font.DemiBold
-            }
-            PmButton {
-                text: "Select All"
-                enabled: controller.documentCount > 0
-                tooltip: "Select every cell in all loaded particles"
-                onClicked: controller.selectAllLoadedTableCells(root.kind)
-            }
-            PmButton {
-                text: "Deselect All"
-                enabled: controller.documentCount > 0
-                tooltip: "Clear selections in all loaded particles"
-                onClicked: controller.clearAllLoadedTableSelections(root.kind)
-            }
-        }
-
-        RowLayout {
-            visible: root.colorMode
-            Layout.fillWidth: true
-            Layout.preferredHeight: visible ? 34 : 0
-            Layout.minimumHeight: visible ? 34 : 0
-            Layout.maximumHeight: visible ? 34 : 0
-            spacing: 7
-            Item { Layout.fillWidth: true }
-            Text {
-                text: "Selection presets"
-                color: Theme.textMuted
-                font.pixelSize: 11
-            }
-            PmButton {
-                text: "Save P1"
-                enabled: root.selectedCount > 0
-                onClicked: controller.saveColorPreset(0, root.selectedCells())
-            }
-            PmButton {
-                text: "P1"
-                tooltip: "Load color selection preset 1"
-                onClicked: root.selectCells(controller.colorPreset(0))
-            }
-            PmButton {
-                text: "Save P2"
-                enabled: root.selectedCount > 0
-                onClicked: controller.saveColorPreset(1, root.selectedCells())
-            }
-            PmButton {
-                text: "P2"
-                tooltip: "Load color selection preset 2"
-                onClicked: root.selectCells(controller.colorPreset(1))
             }
         }
 
@@ -433,16 +422,14 @@ Item {
                 onTriggered: {
                     if (colorCellMenu.targetRow < 0 || colorCellMenu.targetColumn < 0)
                         return
+                    const row = colorCellMenu.targetRow
+                    const column = colorCellMenu.targetColumn
                     const current = root.tableModel.cellText(
-                        colorCellMenu.targetRow, colorCellMenu.targetColumn
+                        row, column
                     )
                     const rgb = controller.pickApplyColor(current)
-                    const color = root.colorFromText(rgb)
-                    if (color !== null) {
-                        controller.setTableCell(
-                            root.kind, colorCellMenu.targetRow, colorCellMenu.targetColumn, rgb
-                        )
-                    }
+                    if (rgb.length > 0)
+                        controller.setTableCell(root.kind, row, column, rgb)
                 }
             }
         }
@@ -569,8 +556,9 @@ Item {
 
                     Rectangle {
                         visible: root.colorMode && !cell.timeCell
-                        anchors.fill: parent
-                        anchors.margins: 4
+                        anchors.centerIn: parent
+                        width: Math.max(0, (parent.width - 8) * 0.8)
+                        height: Math.max(0, (parent.height - 8) * 0.8)
                         radius: 3
                         color: cell.cellColor.length > 0 ? cell.cellColor : "transparent"
                         border.width: 1
@@ -655,10 +643,23 @@ Item {
                     root.dragAnchorColumn = cell[1]
                     root.dragLastRow = cell[0]
                     root.dragLastColumn = cell[1]
+                    const baseline = ({})
+                    const selected = cellSelection.selectedIndexes
+                    for (let selectedIndex = 0; selectedIndex < selected.length; ++selectedIndex) {
+                        baseline[selected[selectedIndex].row + ":" + selected[selectedIndex].column] = true
+                    }
+                    root.dragBaseline = baseline
                     root.additiveDrag = (mouse.modifiers & Qt.ControlModifier) !== 0
+                    root.subtractiveDrag = root.additiveDrag
+                                           && root.dragBaseline[cell[0] + ":" + cell[1]] === true
                     root.dragSelecting = true
                     if (root.additiveDrag) {
-                        cellSelection.select(index, ItemSelectionModel.Toggle)
+                        cellSelection.select(
+                            index,
+                            root.subtractiveDrag
+                                ? ItemSelectionModel.Deselect
+                                : ItemSelectionModel.Select
+                        )
                     } else {
                         cellSelection.clearSelection()
                         cellSelection.select(index, ItemSelectionModel.Select)
@@ -681,6 +682,8 @@ Item {
                     root.dragAnchorColumn = -1
                     root.dragLastRow = -1
                     root.dragLastColumn = -1
+                    root.subtractiveDrag = false
+                    root.dragBaseline = ({})
                     root.syncSelection()
                 }
 

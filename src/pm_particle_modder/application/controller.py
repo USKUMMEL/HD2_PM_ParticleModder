@@ -202,6 +202,8 @@ class ParticleController(QObject):
         self._selected_patch_index = -1
         self._next_patch_number = 0
         self._game_data_directory: Path | None = None
+        self._last_project_open_directory: Path | None = None
+        self._last_project_save_directory: Path | None = None
         self._settings_path = Path(settings_path) if settings_path is not None else self._default_settings_path()
         self._custom_picker_colors: list[str] = []
         self._archive_names: dict[str, str] | None = None
@@ -440,7 +442,12 @@ class ParticleController(QObject):
 
     @Slot()
     def openProject(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(None, "Open PM project", "", "PM Projects (*.pmod)")
+        path, _ = QFileDialog.getOpenFileName(
+            None,
+            "Open PM project",
+            str(self._last_project_open_directory) if self._last_project_open_directory else "",
+            "PM Projects (*.pmod)",
+        )
         if path:
             self._open_project(Path(path))
 
@@ -724,6 +731,8 @@ class ParticleController(QObject):
         if self.current_document is not None:
             self._sort_documents(self.current_document)
         self._project_path = path.resolve()
+        self._last_project_open_directory = self._project_path.parent
+        self._save_preferences()
         if missing:
             QMessageBox.warning(
                 None,
@@ -850,7 +859,10 @@ class ParticleController(QObject):
         if not self.documents_model.documents:
             return
         path, _ = QFileDialog.getSaveFileName(
-            None, "Save PM project", "", "PM Projects (*.pmod)"
+            None,
+            "Save PM project",
+            str(self._last_project_save_directory) if self._last_project_save_directory else "",
+            "PM Projects (*.pmod)",
         )
         if not path:
             return
@@ -924,6 +936,8 @@ class ParticleController(QObject):
                 json.dumps(project_data, indent=2, ensure_ascii=False), encoding="utf-8"
             )
             self._project_path = output_path.resolve()
+            self._last_project_save_directory = self._project_path.parent
+            self._save_preferences()
             self._set_status(f"Saved project {output_path.name}")
         except OSError as error:
             self._show_error("Unable to save project", str(error))
@@ -1400,14 +1414,11 @@ class ParticleController(QObject):
         self._selected_patch_index = index
         self.stateChanged.emit()
 
-    @Slot()
-    def renameSelectedPatch(self) -> None:
+    @Slot(str)
+    def renameSelectedPatchTo(self, name: str) -> None:
         if not self.hasSelectedPatch:
             return
         current = self._patch_targets[self._selected_patch_index]
-        name, accepted = QInputDialog.getText(None, "Rename patch", "Patch name:", text=current.name)
-        if not accepted:
-            return
         normalized = name.strip()
         if not normalized or normalized == current.name:
             return
@@ -1945,10 +1956,23 @@ class ParticleController(QObject):
             self._custom_picker_colors = self._valid_picker_colors(colors)
             self._apply_custom_picker_colors()
 
+        self._last_project_open_directory = self._preference_directory(
+            data.get("lastProjectOpenDirectory")
+        )
+        self._last_project_save_directory = self._preference_directory(
+            data.get("lastProjectSaveDirectory")
+        )
+
     def _save_preferences(self) -> None:
         data = {
             "gameDataDirectory": str(self._game_data_directory) if self._game_data_directory else "",
             "customPickerColors": self._custom_picker_colors,
+            "lastProjectOpenDirectory": (
+                str(self._last_project_open_directory) if self._last_project_open_directory else ""
+            ),
+            "lastProjectSaveDirectory": (
+                str(self._last_project_save_directory) if self._last_project_save_directory else ""
+            ),
         }
         try:
             self._settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1957,6 +1981,16 @@ class ParticleController(QObject):
             temporary.replace(self._settings_path)
         except OSError:
             pass
+
+    @staticmethod
+    def _preference_directory(value) -> Path | None:
+        if not isinstance(value, str) or not value:
+            return None
+        candidate = Path(value).expanduser()
+        try:
+            return candidate.resolve() if candidate.is_dir() else None
+        except OSError:
+            return None
 
     @staticmethod
     def _valid_picker_colors(colors) -> list[str]:
@@ -1981,6 +2015,7 @@ class ParticleController(QObject):
         )
         self._apply_custom_picker_colors()
         self._save_preferences()
+        self.stateChanged.emit()
 
     @Slot(str, "QVariantList")
     def updateSelection(self, kind: str, selection) -> None:

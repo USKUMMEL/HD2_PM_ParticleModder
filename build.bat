@@ -6,6 +6,8 @@ set "ROOT=%~dp0"
 :: remove trailing backslash for cleaner concatenation
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 
+if exist "%ROOT%\dist\PM_ParticleModder" rmdir /s /q "%ROOT%\dist\PM_ParticleModder"
+
 set "ICON=%ROOT%\Icon\icon2.ico"
 if not exist "%ICON%" (
     echo Missing %ICON%
@@ -16,7 +18,7 @@ if not exist "%ICON%" (
 python -m pip install --upgrade pyinstaller || exit /b 1
 
 python -m PyInstaller ^
-    --noconfirm --clean --onedir --windowed ^
+    --noconfirm --clean --onefile --windowed ^
     --name PM_ParticleModder ^
     --icon "%ICON%" ^
     --paths "%ROOT%\src" ^
@@ -32,5 +34,5 @@ python -m PyInstaller ^
 if errorlevel 1 exit /b %errorlevel%
 
 echo.
-echo Build complete: dist\PM_ParticleModder\PM_ParticleModder.exe
+echo Build complete: dist\PM_ParticleModder.exe
 endlocal
