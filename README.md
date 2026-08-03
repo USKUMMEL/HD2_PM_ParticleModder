@@ -39,21 +39,6 @@ For development without installing the package:
 .\run_pm.bat
 ```
 
-## Build Windows Releases
-
-Run:
-
-```powershell
-.\build.bat
-```
-
-The script creates both Windows distributions:
-
-- `dist\PM_ParticleModder.exe`: one-file executable. It extracts dependencies to a temporary location while starting.
-- `dist\PM_ParticleModder\PM_ParticleModder.exe`: portable folder build with dependencies beside the executable. Keep the whole folder together.
-
-The bundled `Icon\icon2.ico` is used for both executable builds.
-
 ## Tests
 
 ```powershell

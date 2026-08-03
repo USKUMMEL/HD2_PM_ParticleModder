@@ -11,6 +11,8 @@ venv/
 env/
 build/
 dist/
+build.bat
+Icon/
 *.egg-info/
 pysidedeploy.spec
 *.log
