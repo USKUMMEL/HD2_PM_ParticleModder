@@ -139,8 +139,6 @@ Item {
         root.selectedCount = cellSelection.selectedIndexes.length
         if (!root.restoringSelection)
             controller.updateSelection(root.kind, root.selectedCells())
-        if (root.colorMode)
-            root.syncApplyColor()
     }
 
     function colorFromText(value) {
@@ -172,14 +170,20 @@ Item {
         const indexes = cellSelection.selectedIndexes
         for (let index = 0; index < indexes.length; ++index) {
             const cell = indexes[index]
-            if (cell.column % 2 === 1) {
-                const color = root.colorFromText(root.tableModel.cellText(cell.row, cell.column))
-                if (color !== null)
-                    root.applyColor = color
-                colorValue.text = root.tableModel.cellText(cell.row, cell.column)
+            if (cell.column % 2 === 1 && root.syncApplyColorFromCell(cell.row, cell.column))
                 return
-            }
         }
+    }
+
+    function syncApplyColorFromCell(row, column) {
+        if (!root.colorMode || column % 2 !== 1)
+            return false
+        const text = root.tableModel.cellText(row, column)
+        const color = root.colorFromText(text)
+        if (color === null)
+            return false
+        root.setApplyColor(color)
+        return true
     }
 
     function selectCells(cells) {
@@ -207,6 +211,14 @@ Item {
         target: root.tableModel
         function onModelAboutToBeReset() { root.restoringSelection = true }
         function onModelReset() { Qt.callLater(root.restoreSelection) }
+    }
+
+    Connections {
+        target: controller
+        function onTableSelectionsChanged(kind) {
+            if (kind === root.kind)
+                Qt.callLater(root.restoreSelection)
+        }
     }
 
     Shortcut {
@@ -240,18 +252,6 @@ Item {
                     root.showTimeColumns = !root.showTimeColumns
                     tableView.forceLayout()
                 }
-            }
-            PmButton {
-                text: "Copy"
-                enabled: root.selectedCount > 0
-                tooltip: "Copy selected cells"
-                onClicked: controller.copyTable(root.kind, root.selectedCells())
-            }
-            PmButton {
-                text: "Paste"
-                enabled: root.selectedCount > 0
-                tooltip: "Paste into selection or from its top-left cell"
-                onClicked: controller.pasteTable(root.kind, root.selectedCells())
             }
             Rectangle { Layout.preferredWidth: 1; Layout.fillHeight: true; Layout.topMargin: 4; Layout.bottomMargin: 4; color: Theme.border }
             PmTextField {
@@ -299,15 +299,39 @@ Item {
                 }
                 onAccepted: applyButton.clicked()
             }
+            Text {
+                text: "CURRENT PARTICLE"
+                color: Theme.textMuted
+                font.pixelSize: 10
+                font.weight: Font.DemiBold
+            }
             PmButton {
                 id: applyButton
                 text: "Apply"
                 enabled: root.applyCells().length > 0
                          && (root.colorMode ? root.colorFromText(colorValue.text) !== null
                                             : fillValue.text.length > 0)
-                tooltip: "Apply one value to all selected cells"
+                tooltip: "Apply to selected cells in the current particle"
                 onClicked: controller.fillTable(
                     root.kind, root.applyCells(), root.colorMode ? colorValue.text : fillValue.text
+                )
+            }
+            Rectangle { Layout.preferredWidth: 1; Layout.fillHeight: true; Layout.topMargin: 4; Layout.bottomMargin: 4; color: Theme.border }
+            Text {
+                text: "ALL TICKED PARTICLES " + controller.applyParticleCount
+                color: Theme.textMuted
+                font.pixelSize: 10
+                font.weight: Font.DemiBold
+            }
+            PmButton {
+                id: applyAppliedButton
+                text: "Apply"
+                enabled: controller.applyParticleCount > 0
+                         && (root.colorMode ? root.colorFromText(colorValue.text) !== null
+                                            : fillValue.text.length > 0)
+                tooltip: "Apply to selected cells in checked particles"
+                onClicked: controller.fillAppliedTables(
+                    root.kind, root.colorMode ? colorValue.text : fillValue.text
                 )
             }
             Item { Layout.fillWidth: true }
@@ -315,6 +339,52 @@ Item {
                 text: root.selectedCount + " selected"
                 color: Theme.textMuted
                 font.pixelSize: 11
+            }
+        }
+
+        RowLayout {
+            visible: root.colorMode
+            Layout.fillWidth: true
+            Layout.preferredHeight: visible ? 34 : 0
+            Layout.minimumHeight: visible ? 34 : 0
+            Layout.maximumHeight: visible ? 34 : 0
+            spacing: 7
+            Text {
+                text: "CURRENT PARTICLE"
+                color: Theme.textMuted
+                font.pixelSize: 10
+                font.weight: Font.DemiBold
+            }
+            PmButton {
+                text: "Select All"
+                enabled: root.tableModel.rowCount() > 0
+                tooltip: "Select every cell in the current particle"
+                onClicked: controller.selectAllTableCells(root.kind)
+            }
+            PmButton {
+                text: "Deselect All"
+                enabled: root.selectedCount > 0
+                tooltip: "Clear the current particle selection"
+                onClicked: controller.clearTableSelection(root.kind)
+            }
+            Rectangle { Layout.preferredWidth: 1; Layout.fillHeight: true; Layout.topMargin: 4; Layout.bottomMargin: 4; color: Theme.border }
+            Text {
+                text: "ALL LOADED PARTICLES"
+                color: Theme.textMuted
+                font.pixelSize: 10
+                font.weight: Font.DemiBold
+            }
+            PmButton {
+                text: "Select All"
+                enabled: controller.documentCount > 0
+                tooltip: "Select every cell in all loaded particles"
+                onClicked: controller.selectAllLoadedTableCells(root.kind)
+            }
+            PmButton {
+                text: "Deselect All"
+                enabled: controller.documentCount > 0
+                tooltip: "Clear selections in all loaded particles"
+                onClicked: controller.clearAllLoadedTableSelections(root.kind)
             }
         }
 
@@ -350,6 +420,30 @@ Item {
                 text: "P2"
                 tooltip: "Load color selection preset 2"
                 onClicked: root.selectCells(controller.colorPreset(1))
+            }
+        }
+
+        Menu {
+            id: colorCellMenu
+            property int targetRow: -1
+            property int targetColumn: -1
+
+            MenuItem {
+                text: "Color Picker"
+                onTriggered: {
+                    if (colorCellMenu.targetRow < 0 || colorCellMenu.targetColumn < 0)
+                        return
+                    const current = root.tableModel.cellText(
+                        colorCellMenu.targetRow, colorCellMenu.targetColumn
+                    )
+                    const rgb = controller.pickApplyColor(current)
+                    const color = root.colorFromText(rgb)
+                    if (color !== null) {
+                        controller.setTableCell(
+                            root.kind, colorCellMenu.targetRow, colorCellMenu.targetColumn, rgb
+                        )
+                    }
+                }
             }
         }
 
@@ -475,13 +569,12 @@ Item {
 
                     Rectangle {
                         visible: root.colorMode && !cell.timeCell
-                        anchors.centerIn: parent
-                        width: 26
-                        height: 20
+                        anchors.fill: parent
+                        anchors.margins: 4
                         radius: 3
                         color: cell.cellColor.length > 0 ? cell.cellColor : "transparent"
                         border.width: 1
-                        border.color: Theme.borderStrong
+                        border.color: "#000000"
                     }
                     Text {
                         anchors.fill: parent
@@ -538,7 +631,7 @@ Item {
                 anchors.bottomMargin: 12
                 z: 2
                 enabled: !root.cellEditing
-                acceptedButtons: Qt.LeftButton
+                acceptedButtons: Qt.LeftButton | Qt.RightButton
                 hoverEnabled: true
                 preventStealing: true
 
@@ -546,13 +639,24 @@ Item {
                     const cell = root.cellAtPosition(mouse.x, mouse.y)
                     if (cell[0] < 0)
                         return
+                    const index = root.tableModel.cellIndex(cell[0], cell[1])
+                    if (mouse.button === Qt.RightButton) {
+                        if (root.colorMode && cell[1] % 2 === 1) {
+                            cellSelection.clearSelection()
+                            cellSelection.select(index, ItemSelectionModel.Select)
+                            cellSelection.setCurrentIndex(index, ItemSelectionModel.NoUpdate)
+                            colorCellMenu.targetRow = cell[0]
+                            colorCellMenu.targetColumn = cell[1]
+                            colorCellMenu.popup()
+                        }
+                        return
+                    }
                     root.dragAnchorRow = cell[0]
                     root.dragAnchorColumn = cell[1]
                     root.dragLastRow = cell[0]
                     root.dragLastColumn = cell[1]
                     root.additiveDrag = (mouse.modifiers & Qt.ControlModifier) !== 0
                     root.dragSelecting = true
-                    const index = root.tableModel.cellIndex(cell[0], cell[1])
                     if (root.additiveDrag) {
                         cellSelection.select(index, ItemSelectionModel.Toggle)
                     } else {

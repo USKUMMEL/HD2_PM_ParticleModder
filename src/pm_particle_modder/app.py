@@ -9,6 +9,7 @@ from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWidgets import QApplication
 
+import pm_particle_modder
 from pm_particle_modder import __version__
 from pm_particle_modder.application import ParticleController
 
@@ -20,10 +21,14 @@ def main() -> int:
     QQuickStyle.setStyle("Basic")
 
     app = QApplication(sys.argv)
-    package_dir = Path(__file__).resolve().parent
-    icon_path = package_dir / "ui" / "assets" / "icon.ico"
+    # PyInstaller runs this entry point from its extraction root. Resolve assets
+    # from the installed package instead, which is stable in source and EXE builds.
+    package_dir = Path(pm_particle_modder.__file__).resolve().parent
+    assets_dir = package_dir / "ui" / "assets"
+    icon_path = assets_dir / "icon.ico"
     if not icon_path.exists():
-        icon_path = package_dir / "ui" / "assets" / "icon.png"
+        bundled_icons = sorted(assets_dir.glob("*.ico"))
+        icon_path = bundled_icons[0] if bundled_icons else assets_dir / "icon.png"
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
 

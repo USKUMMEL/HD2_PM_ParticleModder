@@ -238,7 +238,7 @@ ApplicationWindow {
             spacing: 0
 
             Rectangle {
-                Layout.preferredWidth: window.sidePanelExpanded ? 264 : 46
+                Layout.preferredWidth: window.sidePanelExpanded ? 292 : 46
                 Layout.fillHeight: true
                 color: Theme.surface
 
@@ -346,6 +346,7 @@ ApplicationWindow {
                                 required property string group
                                 required property bool archiveBacked
                                 required property bool patchIncluded
+                                required property bool applyIncluded
                                 required property bool resettable
                                 width: openParticlesList.width - 8
                                 visible: !window.isParticleGroupCollapsed(group)
@@ -359,9 +360,9 @@ ApplicationWindow {
                                 border.color: window.particleIsSelected(index) ? Theme.accent : Theme.borderStrong
 
                                 Text {
-                                    anchors.left: parent.left
+                                    anchors.left: particleApply.right
                                     anchors.right: particlePatch.left
-                                    anchors.leftMargin: 8
+                                    anchors.leftMargin: 4
                                     anchors.rightMargin: 4
                                     anchors.verticalCenter: parent.verticalCenter
                                     text: particleDelegate.title + (particleDelegate.dirty ? " *" : "")
@@ -369,6 +370,48 @@ ApplicationWindow {
                                            || controller.currentIndex === particleDelegate.index ? Theme.text : Theme.textMuted
                                     font.pixelSize: 11
                                     elide: Text.ElideMiddle
+                                }
+                                Rectangle {
+                                    id: particleApply
+                                    width: 22
+                                    height: 22
+                                    anchors.left: parent.left
+                                    anchors.leftMargin: 3
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    radius: 3
+                                    color: particleApplyMouse.containsMouse ? Theme.surfaceHover : "transparent"
+                                    Canvas {
+                                        anchors.centerIn: parent
+                                        width: 15
+                                        height: 15
+                                        property bool included: particleDelegate.applyIncluded
+                                        onIncludedChanged: requestPaint()
+                                        onPaint: {
+                                            const ctx = getContext("2d")
+                                            ctx.clearRect(0, 0, width, height)
+                                            ctx.lineWidth = 1.5
+                                            ctx.strokeStyle = included ? Theme.accent : Theme.textMuted
+                                            ctx.strokeRect(2, 2, 11, 11)
+                                            if (included) {
+                                                ctx.beginPath()
+                                                ctx.moveTo(4, 7.5)
+                                                ctx.lineTo(6.5, 10)
+                                                ctx.lineTo(11.5, 4.8)
+                                                ctx.stroke()
+                                            }
+                                        }
+                                    }
+                                    MouseArea {
+                                        id: particleApplyMouse
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: controller.toggleApplyInclude(particleDelegate.index)
+                                    }
+                                    ToolTip.visible: particleApplyMouse.containsMouse
+                                    ToolTip.text: particleDelegate.applyIncluded
+                                                  ? "Apply target enabled" : "Enable as an apply target"
+                                    ToolTip.delay: 500
                                 }
                                 Rectangle {
                                     id: particleReset
@@ -458,7 +501,7 @@ ApplicationWindow {
                                 }
                                 MouseArea {
                                     id: particleMouse
-                                    anchors.left: parent.left
+                                    anchors.left: particleApply.right
                                     anchors.top: parent.top
                                     anchors.bottom: parent.bottom
                                     anchors.right: particlePatch.left

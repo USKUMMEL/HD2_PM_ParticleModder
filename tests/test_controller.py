@@ -106,6 +106,50 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.controller.selectionFor("color"), selection)
         self.assertEqual(self.controller.colorPreset(0), selection)
 
+    def test_color_fill_applies_to_current_particle_only(self):
+        second_effect = ParticleEffect.from_bytes(make_particle())
+        second_document = Document(Path("second.particles"), second_effect, QUndoStack())
+        self.controller.documents_model.append(second_document)
+        second_document.selections["color"] = [(0, 3)]
+
+        self.controller.fillTable("color", [[0, 1]], "10, 20, 30")
+
+        self.assertEqual(self.controller.color_model.graph_at(0).colors[0], [10.0, 20.0, 30.0])
+        self.assertNotEqual(second_effect.particle_systems[0].color_graphs[0].colors[1], [10.0, 20.0, 30.0])
+        self.assertEqual(second_document.undo_stack.count(), 0)
+
+    def test_color_fill_applies_only_to_checked_particles(self):
+        second_effect = ParticleEffect.from_bytes(make_particle())
+        second_document = Document(Path("second.particles"), second_effect, QUndoStack())
+        second_document.selections["color"] = [(0, 3)]
+        third_effect = ParticleEffect.from_bytes(make_particle())
+        third_document = Document(Path("third.particles"), third_effect, QUndoStack())
+        third_document.selections["color"] = [(0, 3)]
+        self.controller.documents_model.append(second_document)
+        self.controller.documents_model.append(third_document)
+
+        self.controller.toggleApplyInclude(1)
+        self.controller.fillAppliedTables("color", "10, 20, 30")
+
+        self.assertEqual(second_effect.particle_systems[0].color_graphs[0].colors[1], [10.0, 20.0, 30.0])
+        self.assertNotEqual(third_effect.particle_systems[0].color_graphs[0].colors[1], [10.0, 20.0, 30.0])
+        self.assertEqual(self.controller.applyParticleCount, 1)
+
+    def test_select_all_loaded_table_cells_tracks_each_particle(self):
+        second_document = Document(
+            Path("second.particles"), ParticleEffect.from_bytes(make_particle()), QUndoStack()
+        )
+        self.controller.documents_model.append(second_document)
+
+        self.controller.selectAllLoadedTableCells("color")
+
+        self.assertEqual(len(self.document.selections["color"]), self.controller.color_model.rowCount() * 20)
+        self.assertEqual(len(second_document.selections["color"]), self.controller.color_model.rowCount() * 20)
+
+        self.controller.clearAllLoadedTableSelections("color")
+        self.assertEqual(self.document.selections["color"], [])
+        self.assertEqual(second_document.selections["color"], [])
+
     def test_texture_overview_model_uses_strings_for_64_bit_ids(self):
         material_id = 16915718763308572383
         texture_id = 14790446551990181426

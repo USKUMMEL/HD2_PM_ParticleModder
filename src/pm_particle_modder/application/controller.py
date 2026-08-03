@@ -67,6 +67,7 @@ class Document:
     title: str = ""
     source_data: bytes = b""
     include_in_patch: bool = False
+    apply_included: bool = False
     patch_entry_id: int | None = None
     modified_texture_ids: set[int] = field(default_factory=set)
 
@@ -176,6 +177,7 @@ class ParticleController(QObject):
     stateChanged = Signal()
     currentDocumentChanged = Signal()
     statusChanged = Signal()
+    tableSelectionsChanged = Signal(str)
     ARCHIVE_LIST_URL = "https://raw.githubusercontent.com/Boxofbiscuits97/HD2SDK-CommunityEdition/main/hashlists/archivehashes.json"
     BASE_PATCH_ARCHIVE_ID = "9ba626afa44a3aa3"
 
@@ -240,6 +242,10 @@ class ParticleController(QObject):
     @Property(int, notify=stateChanged)
     def documentCount(self) -> int:
         return len(self.documents_model.documents)
+
+    @Property(int, notify=stateChanged)
+    def applyParticleCount(self) -> int:
+        return sum(1 for document in self.documents_model.documents if document.apply_included)
 
     @Property(bool, notify=stateChanged)
     def hasArchive(self) -> bool:
@@ -692,6 +698,7 @@ class ParticleController(QObject):
                     for system, enabled in zip(document.effect.particle_systems, enabled_systems):
                         system.enabled = bool(enabled)
                 document.include_in_patch = bool(item.get("includeInPatch", False))
+                document.apply_included = bool(item.get("applyIncluded", False))
                 document.patch_entry_id = self._valid_patch_entry_id(item.get("patchEntryId"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             try:
@@ -863,6 +870,7 @@ class ParticleController(QObject):
                         "entryId": str(document.archive_entry_id),
                         "note": document.note,
                         "includeInPatch": document.include_in_patch,
+                        "applyIncluded": document.apply_included,
                     }
                 else:
                     try:
@@ -876,6 +884,7 @@ class ParticleController(QObject):
                         "entryId": str(document.archive_entry_id),
                         "note": document.note,
                         "includeInPatch": document.include_in_patch,
+                        "applyIncluded": document.apply_included,
                     }
                 stored_path = self._archive_state_key(file_item)
             else:
@@ -888,6 +897,7 @@ class ParticleController(QObject):
                     "filepath": stored_path,
                     "note": document.note,
                     "includeInPatch": document.include_in_patch,
+                    "applyIncluded": document.apply_included,
                     "patchEntryId": str(document.patch_entry_id) if document.patch_entry_id is not None else "",
                 }
             if document.group:
@@ -1019,6 +1029,15 @@ class ParticleController(QObject):
         if not document.include_in_patch and document.archive is not None and document.archive_entry_id is not None:
             document.archive.staged_entries.pop((document.archive_entry_id, PARTICLE_TYPE_ID), None)
         self._mark_selected_patch_for_write()
+        self.documents_model.refresh(index)
+        self.stateChanged.emit()
+
+    @Slot(int)
+    def toggleApplyInclude(self, index: int) -> None:
+        if not 0 <= index < len(self.documents_model.documents):
+            return
+        document = self.documents_model.documents[index]
+        document.apply_included = not document.apply_included
         self.documents_model.refresh(index)
         self.stateChanged.emit()
 
@@ -1764,20 +1783,68 @@ class ParticleController(QObject):
 
     @Slot(str, "QVariantList", str)
     def fillTable(self, kind: str, selection, text: str) -> None:
-        model = self._graph_model(kind)
-        cells = self._selection_pairs(selection)
-        if model is None or not cells:
+        current_document = self.current_document
+        current_cells = self._selection_pairs(selection)
+        if current_document is None:
             return
-        try:
-            edits = [
-                edit
-                for row, column in cells
-                if (edit := self._make_cell_edit(model, row, column, text)) is not None
-            ]
-        except ValueError as error:
-            self._show_error("Unable to fill selection", str(error))
+        changed_cells = self._fill_document_table(current_document, kind, current_cells, text)
+        if changed_cells:
+            self._set_status(f"Filled {changed_cells} {kind} cells in current particle")
+
+    @Slot(str, str)
+    def fillAppliedTables(self, kind: str, text: str) -> None:
+        changed_cells = 0
+        changed_documents = 0
+        for document in self.documents_model.documents:
+            if not document.apply_included:
+                continue
+            count = self._fill_document_table(document, kind, document.selections.get(kind, []), text)
+            if count:
+                changed_cells += count
+                changed_documents += 1
+        if changed_cells:
+            self._set_status(
+                f"Filled {changed_cells} {kind} cells across {changed_documents} applied particles"
+            )
+
+    @Slot(str)
+    def selectAllTableCells(self, kind: str) -> None:
+        document = self.current_document
+        if document is None:
             return
-        self._push_cell_edits(f"Fill {len(cells)} {kind} cells", model, cells, edits)
+        document.selections[kind] = self._all_table_cells(document, kind)
+        self.tableSelectionsChanged.emit(kind)
+
+    @Slot(str)
+    def clearTableSelection(self, kind: str) -> None:
+        document = self.current_document
+        if document is None:
+            return
+        document.selections[kind] = []
+        self.tableSelectionsChanged.emit(kind)
+
+    @Slot(str)
+    def selectAllLoadedTableCells(self, kind: str) -> None:
+        changed = False
+        for document in self.documents_model.documents:
+            cells = self._all_table_cells(document, kind)
+            if document.selections.get(kind) != cells:
+                document.selections[kind] = cells
+                changed = True
+        if changed:
+            self.tableSelectionsChanged.emit(kind)
+            self._set_status(f"Selected all {kind} cells in loaded particles")
+
+    @Slot(str)
+    def clearAllLoadedTableSelections(self, kind: str) -> None:
+        changed = False
+        for document in self.documents_model.documents:
+            if document.selections.get(kind):
+                document.selections[kind] = []
+                changed = True
+        if changed:
+            self.tableSelectionsChanged.emit(kind)
+            self._set_status(f"Cleared {kind} selections in loaded particles")
 
     @Slot(str, "QVariantList")
     def pasteTable(self, kind: str, selection) -> None:
@@ -1948,7 +2015,11 @@ class ParticleController(QObject):
     def _make_cell_edit(self, model, row: int, column: int, text: str):
         if not (0 <= row < model.rowCount() and 0 <= column < model.columnCount()):
             return None
-        graph = model.graph_at(row)
+        return self._make_graph_cell_edit(model.graph_at(row), column, text)
+
+    def _make_graph_cell_edit(self, graph: Graph | ColorGraph, column: int, text: str):
+        if not 0 <= column < 20:
+            return None
         point = column // 2
         if column % 2 == 0:
             values = graph.x
@@ -1977,6 +2048,59 @@ class ParticleController(QObject):
             target[target_point] = value
 
         return setter, old_value, new_value
+
+    @staticmethod
+    def _document_graphs(document: Document, kind: str) -> list[Graph | ColorGraph]:
+        attribute = {
+            "color": "color_graphs",
+            "opacity": "opacity_graphs",
+            "intensity": "scale_graphs",
+        }.get(kind)
+        if attribute is None:
+            return []
+        return [
+            graph
+            for system in document.effect.particle_systems
+            for graph in getattr(system, attribute)
+        ]
+
+    def _all_table_cells(self, document: Document, kind: str) -> list[tuple[int, int]]:
+        return [
+            (row, column)
+            for row, _graph in enumerate(self._document_graphs(document, kind))
+            for column in range(20)
+        ]
+
+    def _fill_document_table(self, document: Document, kind: str, cells, text: str) -> int:
+        graphs = self._document_graphs(document, kind)
+        pairs = self._selection_pairs(cells)
+        if kind == "color":
+            pairs = [(row, column) for row, column in pairs if column % 2 == 1]
+        if not graphs or not pairs:
+            return 0
+        try:
+            edits = [
+                edit
+                for row, column in pairs
+                if 0 <= row < len(graphs)
+                and (edit := self._make_graph_cell_edit(graphs[row], column, text)) is not None
+                and edit[1] != edit[2]
+            ]
+        except ValueError as error:
+            self._show_error("Unable to fill selection", str(error))
+            return 0
+        if not edits:
+            return 0
+
+        def refresh():
+            if document is self.current_document:
+                model = self._graph_model(kind)
+                if model is not None:
+                    model.refresh_cells(pairs)
+            self._document_state_changed(document)
+
+        document.undo_stack.push(BulkEditCommand(f"Fill {len(edits)} {kind} cells", edits, refresh))
+        return len(edits)
 
     @staticmethod
     def _parse_number(text: str) -> float:

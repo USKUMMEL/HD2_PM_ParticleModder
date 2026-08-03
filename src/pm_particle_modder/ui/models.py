@@ -23,6 +23,7 @@ class DocumentListModel(QAbstractListModel):
     ArchiveRole = GroupRole + 1
     PatchIncludedRole = ArchiveRole + 1
     ResettableRole = PatchIncludedRole + 1
+    ApplyIncludedRole = ResettableRole + 1
 
     def __init__(self):
         super().__init__()
@@ -38,6 +39,7 @@ class DocumentListModel(QAbstractListModel):
             self.ArchiveRole: QByteArray(b"archiveBacked"),
             self.PatchIncludedRole: QByteArray(b"patchIncluded"),
             self.ResettableRole: QByteArray(b"resettable"),
+            self.ApplyIncludedRole: QByteArray(b"applyIncluded"),
         }
 
     def rowCount(self, parent=QModelIndex()):
@@ -61,6 +63,8 @@ class DocumentListModel(QAbstractListModel):
             return document.archive is not None
         if role == self.PatchIncludedRole:
             return document.include_in_patch
+        if role == self.ApplyIncludedRole:
+            return document.apply_included
         if role == self.ResettableRole:
             try:
                 return (
