@@ -18,6 +18,22 @@ if not exist "%ICON%" (
 python -m pip install --upgrade pyinstaller || exit /b 1
 
 python -m PyInstaller ^
+    --noconfirm --clean --onedir --windowed ^
+    --name PM_ParticleModder ^
+    --icon "%ICON%" ^
+    --paths "%ROOT%\src" ^
+    --add-data "%ROOT%\src\pm_particle_modder\ui\qml;pm_particle_modder\ui\qml" ^
+    --add-data "%ROOT%\src\pm_particle_modder\ui\assets;pm_particle_modder\ui\assets" ^
+    --add-data "%ROOT%\src\pm_particle_modder\tools;pm_particle_modder\tools" ^
+    --add-data "%ICON%;pm_particle_modder\ui\assets" ^
+    --workpath "%ROOT%\build\pyinstaller" ^
+    --specpath "%ROOT%\build" ^
+    --distpath "%ROOT%\dist" ^
+    "%ROOT%\src\pm_particle_modder\app.py"
+
+if errorlevel 1 exit /b %errorlevel%
+
+python -m PyInstaller ^
     --noconfirm --clean --onefile --windowed ^
     --name PM_ParticleModder ^
     --icon "%ICON%" ^
@@ -34,5 +50,7 @@ python -m PyInstaller ^
 if errorlevel 1 exit /b %errorlevel%
 
 echo.
-echo Build complete: dist\PM_ParticleModder.exe
+echo Build complete:
+echo   One file: dist\PM_ParticleModder.exe
+echo   Portable: dist\PM_ParticleModder\PM_ParticleModder.exe
 endlocal

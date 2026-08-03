@@ -10,6 +10,7 @@ ApplicationWindow {
     minimumWidth: 880
     minimumHeight: 600
     visible: true
+    visibility: Window.Maximized
     color: Theme.background
     title: controller.hasDocument
            ? controller.currentTitle + " - PM ParticleModder"
