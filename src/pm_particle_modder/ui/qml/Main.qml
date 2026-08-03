@@ -286,7 +286,7 @@ ApplicationWindow {
             spacing: 0
 
             Rectangle {
-                Layout.preferredWidth: window.sidePanelExpanded ? 292 : 46
+                Layout.preferredWidth: window.sidePanelExpanded ? 365 : 46
                 Layout.fillHeight: true
                 color: Theme.surface
 
@@ -330,7 +330,7 @@ ApplicationWindow {
                     }
                     Rectangle {
                         Layout.fillWidth: true
-                        Layout.preferredHeight: 158
+                        Layout.preferredHeight: 316
                         color: Theme.background
                         border.width: 1
                         border.color: Theme.border
@@ -879,13 +879,14 @@ ApplicationWindow {
                                     required property string materialId
                                     required property string unitId
                                     required property string meshId
+                                    required property string meshArchive
                                     required property bool hasMaterial
                                     required property bool hasUnit
                                     required property bool hasMesh
                                     required property bool systemEnabled
                                     required property int systemIndex
                                     width: visualizerList.width - 12
-                                    height: 74 + (hasMaterial ? 54 : 0) + (hasUnit ? 54 : 0) + (hasMesh ? 54 : 0)
+                                    height: 74 + (hasMaterial ? 54 : 0) + (hasUnit ? 54 : 0) + (hasMesh ? 108 : 0)
                                     radius: 6
                                     color: systemEnabled ? Theme.surface : Theme.surfaceHover
                                     border.width: 1
@@ -910,6 +911,7 @@ ApplicationWindow {
                                         IdField { visible: visualizerDelegate.hasMaterial; label: "Material ID"; value: visualizerDelegate.materialId; field: "material"; row: visualizerDelegate.index }
                                         IdField { visible: visualizerDelegate.hasUnit; label: "Unit ID"; value: visualizerDelegate.unitId; field: "unit"; row: visualizerDelegate.index }
                                         IdField { visible: visualizerDelegate.hasMesh; label: "Mesh ID"; value: visualizerDelegate.meshId; field: "mesh"; row: visualizerDelegate.index }
+                                        ArchiveField { visible: visualizerDelegate.hasMesh; label: "Mesh archive"; value: visualizerDelegate.meshArchive }
                                         Item { Layout.fillHeight: true }
                                     }
                                 }
@@ -1638,6 +1640,34 @@ ApplicationWindow {
             text: idFieldRoot.value
             inputMethodHints: Qt.ImhDigitsOnly
             onEditingFinished: controller.setVisualizerId(idFieldRoot.row, idFieldRoot.field, text)
+        }
+    }
+
+    component ArchiveField: RowLayout {
+        id: archiveFieldRoot
+        property string label
+        property string value
+        Layout.fillWidth: true
+        Layout.preferredHeight: visible ? 46 : 0
+        spacing: 10
+        Text { text: archiveFieldRoot.label; color: Theme.textMuted; font.pixelSize: 11; Layout.preferredWidth: 88 }
+        Rectangle {
+            Layout.fillWidth: true
+            Layout.preferredHeight: 32
+            color: Theme.surfaceRaised
+            border.width: 1
+            border.color: Theme.border
+            radius: 4
+            Text {
+                anchors.fill: parent
+                anchors.leftMargin: 9
+                anchors.rightMargin: 9
+                verticalAlignment: Text.AlignVCenter
+                text: archiveFieldRoot.value
+                color: Theme.text
+                font.pixelSize: 12
+                elide: Text.ElideMiddle
+            }
         }
     }
 

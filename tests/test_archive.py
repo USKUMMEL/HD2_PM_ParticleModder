@@ -4,6 +4,7 @@ from pathlib import Path
 import struct
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from pm_particle_modder.core import (
     MATERIAL_TYPE_ID,
@@ -13,6 +14,7 @@ from pm_particle_modder.core import (
     ArchiveReader,
     ParticleEffect,
     SlimArchiveStore,
+    dds_to_png,
     parse_material,
     parse_texture,
     preview_dds,
@@ -73,6 +75,18 @@ def make_dsar_resources(resources: list[bytes]) -> bytes:
 
 
 class ArchiveTests(unittest.TestCase):
+    def test_dds_preview_reuses_existing_png_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_directory = Path(directory)
+            cached_preview = cache_directory / "texture.png"
+            cached_preview.write_bytes(b"cached preview")
+
+            with patch("pm_particle_modder.core.archive._run_texconv") as run_texconv:
+                preview = dds_to_png(make_dds(b"texture"), cache_directory, "texture")
+
+            self.assertEqual(preview, cached_preview)
+            run_texconv.assert_not_called()
+
     def test_material_and_unit_reference_parsers(self):
         material = bytearray(160)
         struct.pack_into("<Q", material, 24, 77)

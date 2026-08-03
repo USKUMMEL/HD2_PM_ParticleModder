@@ -25,6 +25,7 @@ from pm_particle_modder import __version__
 from pm_particle_modder.core import (
     PARTICLE_TYPE_ID,
     TEXTURE_TYPE_ID,
+    UNIT_TYPE_ID,
     ArchiveEntry,
     ArchiveError,
     ArchiveReader,
@@ -1544,6 +1545,24 @@ class ParticleController(QObject):
         if self._texture_list_view:
             self._queue_texture_overview_previews()
 
+    def _mesh_archive_locations(self, document: Document | None) -> dict[int, str]:
+        if document is None or document.archive is None:
+            return {}
+        locations: dict[int, str] = {}
+        archives = [document.archive, *self._archives_for_patch()]
+        for system in document.effect.particle_systems:
+            visualizer = system.visualizer
+            if visualizer is None or visualizer.mesh_id is None or visualizer.unit_id is None:
+                continue
+            for archive in archives:
+                archive_id = archive.resource_archive_id(visualizer.unit_id, UNIT_TYPE_ID)
+                if archive_id is not None:
+                    locations[system.index] = archive_id
+                    break
+            else:
+                locations[system.index] = "Not found in available archives"
+        return locations
+
     def _queue_texture_overview_previews(self) -> None:
         self._texture_overview_request += 1
         request_id = self._texture_overview_request
@@ -1615,12 +1634,12 @@ class ParticleController(QObject):
         self.color_model.set_effect(effect)
         self.opacity_model.set_effect(effect)
         self.intensity_model.set_effect(effect)
-        self.visualizer_model.set_effect(effect)
         active_archive = self.current_document.archive if self.current_document else None
         for archive in self._archives_for_patch():
             if archive is not active_archive and hasattr(archive, "clear_payload_cache"):
                 archive.clear_payload_cache()
         self._refresh_assets()
+        self.visualizer_model.set_effect(effect, self._mesh_archive_locations(self.current_document))
         self.currentDocumentChanged.emit()
         self.stateChanged.emit()
 
@@ -2231,8 +2250,8 @@ class ParticleController(QObject):
 
         def apply(new_value):
             setattr(visualizer, attribute, new_value)
-            self.visualizer_model.refresh(row)
             self._refresh_assets()
+            self.visualizer_model.set_effect(document.effect, self._mesh_archive_locations(document))
 
         self._push_edit(f"Edit {field} ID", apply, old_value, value)
 

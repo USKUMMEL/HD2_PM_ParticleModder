@@ -157,10 +157,15 @@ class SlimArchiveStore:
 
     def find_resource(self, file_id: int, type_id: int) -> ArchiveEntry | None:
         """Resolve one resource lazily from another logical Slim archive."""
+        location = self.resource_archive_id(file_id, type_id)
+        return self.open_archive(location).get_entry(file_id, type_id) if location else None
+
+    def resource_archive_id(self, file_id: int, type_id: int) -> str | None:
+        """Return the Slim package ID that owns a resource without loading its payload."""
         key = (file_id, type_id)
         location = self._resource_locations.get(key, ...)
         if location is not ...:
-            return self.open_archive(location).get_entry(file_id, type_id) if location else None
+            return location
 
         for package in self.packages.values():
             if package.name.endswith((".gpu_resources", ".stream")):
@@ -168,7 +173,7 @@ class SlimArchiveStore:
             if not self._package_contains(package, key):
                 continue
             self._resource_locations[key] = package.name
-            return self.open_archive(package.name).get_entry(file_id, type_id)
+            return package.name
         self._resource_locations[key] = None
         return None
 
@@ -427,6 +432,16 @@ class ArchiveReader:
         if entry is None:
             self._missing_entry_keys.add(key)
         return entry
+
+    def resource_archive_id(self, file_id: int, type_id: int) -> str | None:
+        """Return the archive ID that owns a resource without loading its payload."""
+        if (file_id, type_id) in self._by_key:
+            return self.path.name
+        return (
+            self._slim_store.resource_archive_id(file_id, type_id)
+            if self._slim_store is not None
+            else None
+        )
 
     def reload_entry_full(self, file_id: int, type_id: int) -> ArchiveEntry | None:
         entry = self.get_entry(file_id, type_id)
@@ -702,13 +717,15 @@ def dds_to_png(dds: bytes, output_directory: str | Path, name: str) -> Path:
     """Convert a DDS payload to a persistent PNG suitable for the QML viewer."""
     if len(dds) < 148 or dds[:4] != b"DDS ":
         raise ArchiveError("Texture preview requires a complete DDS texture.")
-    executable = _texconv_executable()
-    if not executable:
-        raise ArchiveError("Texture preview needs DirectXTex texconv. Add texconv to PATH or set PM_TEXCONV.")
     output = Path(output_directory)
     output.mkdir(parents=True, exist_ok=True)
     source = output / f"{name}.dds"
     png_path = output / f"{name}.png"
+    if png_path.is_file() and png_path.stat().st_size > 0:
+        return png_path
+    executable = _texconv_executable()
+    if not executable:
+        raise ArchiveError("Texture preview needs DirectXTex texconv. Add texconv to PATH or set PM_TEXCONV.")
     source.write_bytes(dds)
     command = [
         executable, "-y", "-o", str(output), "-ft", "png",

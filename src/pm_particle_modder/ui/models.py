@@ -227,10 +227,12 @@ class VisualizerListModel(QAbstractListModel):
     HasMeshRole = HasUnitRole + 1
     EnabledRole = HasMeshRole + 1
     SystemIndexRole = EnabledRole + 1
+    MeshArchiveRole = SystemIndexRole + 1
 
     def __init__(self):
         super().__init__()
         self.entries = []
+        self.mesh_archives: dict[int, str] = {}
 
     def roleNames(self):
         return {
@@ -244,6 +246,7 @@ class VisualizerListModel(QAbstractListModel):
             self.HasMeshRole: QByteArray(b"hasMesh"),
             self.EnabledRole: QByteArray(b"systemEnabled"),
             self.SystemIndexRole: QByteArray(b"systemIndex"),
+            self.MeshArchiveRole: QByteArray(b"meshArchive"),
         }
 
     def rowCount(self, parent=QModelIndex()):
@@ -274,11 +277,14 @@ class VisualizerListModel(QAbstractListModel):
             return system.enabled
         if role == self.SystemIndexRole:
             return system.index
+        if role == self.MeshArchiveRole:
+            return self.mesh_archives.get(system.index, "") if visualizer and visualizer.mesh_id is not None else ""
         return None
 
-    def set_effect(self, effect: ParticleEffect | None) -> None:
+    def set_effect(self, effect: ParticleEffect | None, mesh_archives: dict[int, str] | None = None) -> None:
         self.beginResetModel()
         self.entries.clear()
+        self.mesh_archives = dict(mesh_archives or {})
         if effect is not None:
             self.entries.extend(effect.particle_systems)
         self.endResetModel()
