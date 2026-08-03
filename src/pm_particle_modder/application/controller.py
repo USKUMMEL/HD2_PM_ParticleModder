@@ -35,6 +35,7 @@ from pm_particle_modder.core import (
     ParticleParseError,
     parse_texture,
     preview_dds,
+    SlimArchiveStore,
     write_patch_archive,
 )
 from pm_particle_modder.ui.models import (
@@ -202,6 +203,7 @@ class ParticleController(QObject):
         self._selected_patch_index = -1
         self._next_patch_number = 0
         self._game_data_directory: Path | None = None
+        self._slim_store: SlimArchiveStore | None = None
         self._last_project_open_directory: Path | None = None
         self._last_project_save_directory: Path | None = None
         self._settings_path = Path(settings_path) if settings_path is not None else self._default_settings_path()
@@ -475,6 +477,8 @@ class ParticleController(QObject):
         if not (data_directory / "bundles.nxa").is_file():
             self._show_error("Invalid game data folder", "Could not find bundles.nxa in this folder.")
             return
+        if self._game_data_directory != data_directory:
+            self._slim_store = None
         self._game_data_directory = data_directory
         self._save_preferences()
         self._set_status(f"Game data folder set: {data_directory}")
@@ -511,7 +515,7 @@ class ParticleController(QObject):
             if self._game_data_directory is None:
                 return
         try:
-            archive = ArchiveReader.open_slim(self._game_data_directory, archive_id)
+            archive = self._open_slim_archive(archive_id)
         except (OSError, ArchiveError) as error:
             self._show_error("Unable to load Slim archive", str(error))
             return
@@ -527,6 +531,16 @@ class ParticleController(QObject):
         if last_document is not None:
             self._sort_documents(last_document)
         self._set_status(f"Loaded {opened} particle resource(s) from {group}")
+
+    def _open_slim_archive(self, archive_id: str) -> ArchiveReader:
+        if self._game_data_directory is None:
+            raise ArchiveError("Select a Helldivers 2 data folder before loading a Slim archive.")
+        if (
+            self._slim_store is None
+            or self._slim_store.data_directory != self._game_data_directory
+        ):
+            self._slim_store = SlimArchiveStore(self._game_data_directory)
+        return self._slim_store.open_archive(archive_id)
 
     def _load_archive_names(self) -> dict[str, str]:
         if self._archive_names is not None:
@@ -783,7 +797,7 @@ class ParticleController(QObject):
             try:
                 archive = archive_cache.get(cache_key)
                 if archive is None:
-                    archive = ArchiveReader.open_slim(self._game_data_directory, archive_id)
+                    archive = self._open_slim_archive(archive_id)
                     archive_cache[cache_key] = archive
             except (OSError, ArchiveError) as error:
                 return None, f"Archive {archive_id}: {error}"
@@ -1602,6 +1616,10 @@ class ParticleController(QObject):
         self.opacity_model.set_effect(effect)
         self.intensity_model.set_effect(effect)
         self.visualizer_model.set_effect(effect)
+        active_archive = self.current_document.archive if self.current_document else None
+        for archive in self._archives_for_patch():
+            if archive is not active_archive and hasattr(archive, "clear_payload_cache"):
+                archive.clear_payload_cache()
         self._refresh_assets()
         self.currentDocumentChanged.emit()
         self.stateChanged.emit()

@@ -155,7 +155,9 @@ class ArchiveTests(unittest.TestCase):
             archive = ArchiveReader.open(archive_path)
 
             self.assertEqual(archive.gpu_data, b"")
+            self.assertEqual(archive.toc_data, b"")
             self.assertEqual(archive.entries[0].gpu_data, b"")
+            self.assertEqual(archive.entries_of_type(TEXTURE_TYPE_ID)[0].gpu_data, b"")
             self.assertEqual(parse_texture(archive.get_entry(TEXTURE_ID, TEXTURE_TYPE_ID)).dds, dds)
 
     def test_slim_store_reconstructs_archive_by_id(self):

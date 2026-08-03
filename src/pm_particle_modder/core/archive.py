@@ -354,7 +354,7 @@ class SlimArchiveStore:
 class ArchiveReader:
     """Read one standalone Stingray package without loading the Blender SDK."""
 
-    PAYLOAD_CACHE_BYTES = 96 * 1024 * 1024
+    PAYLOAD_CACHE_BYTES = 32 * 1024 * 1024
 
     def __init__(self, path: Path, toc_data: bytes, gpu_data: bytes, stream_data: bytes,
                  slim_store: SlimArchiveStore | None = None, entry_loader=None, full_entry_loader=None):
@@ -365,6 +365,9 @@ class ArchiveReader:
         self.entries = _parse_entries(
             self.toc_data, self.gpu_data, self.stream_data, allow_missing_sidecars=entry_loader is not None
         )
+        # Entries own the resource slices needed after parsing. Keeping the full ToC as
+        # well duplicates an archive-sized buffer for every archive left open in the UI.
+        self.toc_data = b""
         self._by_key = {(entry.file_id, entry.type_id): entry for entry in self.entries}
         self.staged_entries: dict[tuple[int, int], ArchiveEntry] = {}
         self._slim_store = slim_store
@@ -436,9 +439,14 @@ class ArchiveReader:
 
     def entries_of_type(self, type_id: int) -> list[ArchiveEntry]:
         return [
-            self.get_entry(entry.file_id, entry.type_id)
+            self.staged_entries.get((entry.file_id, entry.type_id), entry)
             for entry in self.entries if entry.type_id == type_id
         ]
+
+    def clear_payload_cache(self) -> None:
+        """Release lazily loaded sidecar resource data without touching staged edits."""
+        self._payload_cache.clear()
+        self._payload_cache_size = 0
 
     def stage(self, entry: ArchiveEntry) -> None:
         self.staged_entries[(entry.file_id, entry.type_id)] = entry
@@ -682,7 +690,7 @@ def png_to_dds(png_path: Path, dxgi_format: int) -> bytes:
             executable, "-y", "-o", directory, "-ft", "dds", "-dx10",
             "-f", dxgi_format_name(dxgi_format), "-sepalpha", "-alpha", "--", str(png_path),
         ]
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        result = _run_texconv(command)
         dds_path = Path(directory) / f"{png_path.stem}.dds"
         if result.returncode != 0 or not dds_path.is_file():
             message = result.stderr.strip() or result.stdout.strip() or "texconv did not create DDS output."
@@ -706,7 +714,7 @@ def dds_to_png(dds: bytes, output_directory: str | Path, name: str) -> Path:
         executable, "-y", "-o", str(output), "-ft", "png",
         "-f", "R8G8B8A8_UNORM", "-sepalpha", "-alpha", "--", str(source),
     ]
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    result = _run_texconv(command)
     if result.returncode != 0 or not png_path.is_file():
         message = result.stderr.strip() or result.stdout.strip() or "texconv did not create PNG output."
         raise ArchiveError(f"Texture preview conversion failed: {message}")
@@ -718,6 +726,17 @@ def _texconv_executable() -> str | None:
     if bundled.is_file():
         return str(bundled)
     return os.environ.get("PM_TEXCONV") or shutil.which("texconv") or shutil.which("texconv.exe")
+
+
+def _run_texconv(command: list[str]) -> subprocess.CompletedProcess[str]:
+    options = {"capture_output": True, "text": True, "check": False}
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        options["startupinfo"] = startupinfo
+        options["creationflags"] = subprocess.CREATE_NO_WINDOW
+    return subprocess.run(command, **options)
 
 
 def dxgi_format_name(value: int) -> str:

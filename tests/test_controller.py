@@ -266,12 +266,14 @@ class ControllerTests(unittest.TestCase):
             restored = ParticleController(settings_path=root / "preferences.json")
             restored._game_data_directory = data_directory
             with patch(
-                "pm_particle_modder.application.controller.ArchiveReader.open_slim",
-                return_value=archive,
-            ) as open_slim:
+                "pm_particle_modder.application.controller.SlimArchiveStore",
+            ) as store_type:
+                store_type.return_value.data_directory = data_directory
+                store_type.return_value.open_archive.return_value = archive
                 restored._open_project(project_path)
 
-            open_slim.assert_called_once_with(data_directory, archive_id)
+            store_type.assert_called_once_with(data_directory)
+            store_type.return_value.open_archive.assert_called_once_with(archive_id)
             self.assertEqual(restored.documents_model.rowCount(), 1)
             self.assertEqual(restored.current_document.archive_entry_id, particle_id)
 
@@ -306,9 +308,10 @@ class ControllerTests(unittest.TestCase):
             controller = ParticleController(settings_path=root / "preferences.json")
             controller._game_data_directory = data_directory
             with patch(
-                "pm_particle_modder.application.controller.ArchiveReader.open_slim",
-                return_value=archive,
-            ):
+                "pm_particle_modder.application.controller.SlimArchiveStore",
+            ) as store_type:
+                store_type.return_value.data_directory = data_directory
+                store_type.return_value.open_archive.return_value = archive
                 controller._open_project(project_path)
 
             self.assertEqual(controller.documents_model.rowCount(), 1)

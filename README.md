@@ -24,6 +24,11 @@ Personal particle modding tool for Helldivers 2. PM ParticleModder is a Windows 
 
 Standalone particles can be saved directly. Archive particles and texture replacements are saved through a patch archive.
 
+## Windows Releases
+
+- `PM_ParticleModder_Standalone.exe`: single-file release. It extracts bundled dependencies to a temporary location when launching.
+- `PM_ParticleModder_Portable.zip`: portable release with dependencies. Extract the complete archive, then run `PM_ParticleModder.exe` from the extracted folder.
+
 ## Run From Source
 
 Python 3.11 or newer is required.
