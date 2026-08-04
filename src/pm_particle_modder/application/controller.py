@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import colorsys
 import json
 import math
 import os
@@ -76,6 +77,8 @@ class Document:
     apply_included: bool = False
     patch_entry_id: int | None = None
     modified_texture_ids: set[int] = field(default_factory=set)
+    selection_undo: list[tuple[str, list[tuple[int, int]], list[tuple[int, int]]]] = field(default_factory=list)
+    selection_redo: list[tuple[str, list[tuple[int, int]], list[tuple[int, int]]]] = field(default_factory=list)
 
 
 @dataclass
@@ -445,12 +448,22 @@ class ParticleController(QObject):
     @Property(bool, notify=stateChanged)
     def canUndo(self) -> bool:
         document = self.current_document
-        return document.undo_stack.canUndo() if document else False
+        return bool(document and document.undo_stack.canUndo())
 
     @Property(bool, notify=stateChanged)
     def canRedo(self) -> bool:
         document = self.current_document
-        return document.undo_stack.canRedo() if document else False
+        return bool(document and document.undo_stack.canRedo())
+
+    @Property(bool, notify=stateChanged)
+    def canUndoSelection(self) -> bool:
+        document = self.current_document
+        return bool(document and document.selection_undo)
+
+    @Property(bool, notify=stateChanged)
+    def canRedoSelection(self) -> bool:
+        document = self.current_document
+        return bool(document and document.selection_redo)
 
     @Property(str, notify=statusChanged)
     def statusMessage(self) -> str:
@@ -1172,6 +1185,8 @@ class ParticleController(QObject):
         document.undo_stack.clear()
         document.undo_stack.setClean()
         document.selections = {"color": [], "opacity": [], "intensity": []}
+        document.selection_undo.clear()
+        document.selection_redo.clear()
         document.color_presets = [None, None]
         self._reset_document_texture_replacements(document)
         if document.archive is not None and document.archive_entry_id is not None:
@@ -1984,6 +1999,28 @@ class ParticleController(QObject):
         if self.current_document:
             self.current_document.undo_stack.redo()
 
+    @Slot()
+    def undoSelection(self) -> None:
+        document = self.current_document
+        if document is None or not document.selection_undo:
+            return
+        kind, old_selection, new_selection = document.selection_undo.pop()
+        document.selections[kind] = old_selection
+        document.selection_redo.append((kind, old_selection, new_selection))
+        self.tableSelectionsChanged.emit(kind)
+        self.stateChanged.emit()
+
+    @Slot()
+    def redoSelection(self) -> None:
+        document = self.current_document
+        if document is None or not document.selection_redo:
+            return
+        kind, old_selection, new_selection = document.selection_redo.pop()
+        document.selections[kind] = new_selection
+        document.selection_undo.append((kind, old_selection, new_selection))
+        self.tableSelectionsChanged.emit(kind)
+        self.stateChanged.emit()
+
     @Slot(str, int, int, str, result=bool)
     def setTableCell(self, kind: str, row: int, column: int, text: str) -> bool:
         model = self._graph_model(kind)
@@ -1992,7 +2029,8 @@ class ParticleController(QObject):
         try:
             edit = self._make_cell_edit(model, row, column, text)
         except ValueError as error:
-            self._show_error("Invalid cell value", str(error))
+            if kind != "color":
+                self._show_error("Invalid cell value", str(error))
             model.refresh_cells([(row, column)])
             return False
         if edit is None:
@@ -2018,6 +2056,15 @@ class ParticleController(QObject):
         if changed_cells:
             self._set_status(f"Filled {changed_cells} {kind} cells in current particle")
 
+    @Slot(str, "QVariantList", int)
+    def fillTableHue(self, kind: str, selection, hue: int) -> None:
+        document = self.current_document
+        if document is None or kind != "color":
+            return
+        changed = self._fill_document_hue(document, self._selection_pairs(selection), hue)
+        if changed:
+            self._set_status(f"Applied hue to {changed} color cells")
+
     @Slot(str, str)
     def fillAppliedTables(self, kind: str, text: str) -> None:
         changed_cells = 0
@@ -2034,21 +2081,35 @@ class ParticleController(QObject):
                 f"Filled {changed_cells} {kind} cells across {changed_documents} applied particles"
             )
 
+    @Slot(str, int)
+    def fillAppliedTablesHue(self, kind: str, hue: int) -> None:
+        if kind != "color":
+            return
+        changed_cells = 0
+        changed_documents = 0
+        for document in self.documents_model.documents:
+            if not document.apply_included:
+                continue
+            count = self._fill_document_hue(document, document.selections.get(kind, []), hue)
+            if count:
+                changed_cells += count
+                changed_documents += 1
+        if changed_cells:
+            self._set_status(f"Applied hue to {changed_cells} color cells across {changed_documents} applied particles")
+
     @Slot(str)
     def selectAllTableCells(self, kind: str) -> None:
         document = self.current_document
         if document is None:
             return
-        document.selections[kind] = self._all_table_cells(document, kind)
-        self.tableSelectionsChanged.emit(kind)
+        self._set_document_selection(document, kind, self._all_table_cells(document, kind), emit=True)
 
     @Slot(str)
     def clearTableSelection(self, kind: str) -> None:
         document = self.current_document
         if document is None:
             return
-        document.selections[kind] = []
-        self.tableSelectionsChanged.emit(kind)
+        self._set_document_selection(document, kind, [], emit=True)
 
     @Slot(str)
     def selectAllLoadedTableCells(self, kind: str) -> None:
@@ -2148,6 +2209,23 @@ class ParticleController(QObject):
         self._remember_custom_picker_color(selected)
         return f"{selected.red()}, {selected.green()}, {selected.blue()}"
 
+    @Slot(str, result=int)
+    def pickApplyHue(self, current_rgb: str) -> int:
+        rgb = self.pickApplyColor(current_rgb)
+        if not rgb:
+            return -1
+        return self.colorHue(rgb)
+
+    @Slot(str, result=int)
+    def colorHue(self, rgb: str) -> int:
+        try:
+            parts = [round(self._parse_number(part)) for part in rgb.strip().strip("()[]").split(",")]
+            if len(parts) != 3:
+                return -1
+            return QColor(*parts).hsvHue()
+        except ValueError:
+            return -1
+
     @staticmethod
     def _default_settings_path() -> Path:
         location = QStandardPaths.writableLocation(
@@ -2237,7 +2315,21 @@ class ParticleController(QObject):
     def updateSelection(self, kind: str, selection) -> None:
         document = self.current_document
         if document is not None and kind in document.selections:
-            document.selections[kind] = self._selection_pairs(selection)
+            self._set_document_selection(document, kind, self._selection_pairs(selection), emit=False)
+
+    def _set_document_selection(self, document: Document, kind: str, selection, emit: bool) -> None:
+        if kind not in document.selections:
+            return
+        old_selection = list(document.selections[kind])
+        new_selection = self._selection_pairs(selection)
+        if old_selection == new_selection:
+            return
+        document.selections[kind] = new_selection
+        document.selection_undo.append((kind, old_selection, new_selection))
+        document.selection_redo.clear()
+        if emit:
+            self.tableSelectionsChanged.emit(kind)
+        self.stateChanged.emit()
 
     @Slot(str, result="QVariantList")
     def selectionFor(self, kind: str):
@@ -2351,6 +2443,35 @@ class ParticleController(QObject):
             self._document_state_changed(document)
 
         document.undo_stack.push(BulkEditCommand(f"Fill {len(edits)} {kind} cells", edits, refresh))
+        return len(edits)
+
+    def _fill_document_hue(self, document: Document, cells, hue: int) -> int:
+        if not 0 <= hue <= 359:
+            return 0
+        edits = []
+        for row, column in cells:
+            if column % 2 != 1:
+                continue
+            graphs = self._document_graphs(document, "color")
+            if not 0 <= row < len(graphs) or not isinstance(graphs[row], ColorGraph):
+                continue
+            values = graphs[row].colors[column // 2]
+            old_value = list(values)
+            red, green, blue = (channel / 255.0 for channel in old_value)
+            _old_hue, saturation, value = colorsys.rgb_to_hsv(red, green, blue)
+            new_value = [channel * 255.0 for channel in colorsys.hsv_to_rgb(hue / 359.0, saturation, value)]
+            if old_value == new_value:
+                continue
+            edits.append((lambda value, target=values: target.__setitem__(slice(None), value), old_value, new_value))
+        if not edits:
+            return 0
+
+        def refresh():
+            if document is self.current_document:
+                self.color_model.refresh_cells(cells)
+            self._document_state_changed(document)
+
+        document.undo_stack.push(BulkEditCommand(f"Apply hue to {len(edits)} color cells", edits, refresh))
         return len(edits)
 
     @staticmethod

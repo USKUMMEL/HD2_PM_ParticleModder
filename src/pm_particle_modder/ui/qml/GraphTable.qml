@@ -358,6 +358,17 @@ Item {
                     root.kind, root.applyCells(), root.colorMode ? colorValue.text : fillValue.text
                 )
             }
+            PmButton {
+                visible: root.colorMode
+                text: "Apply Hue"
+                enabled: root.applyCells().length > 0
+                tooltip: "Apply the hue from the selected apply color"
+                onClicked: {
+                    const hue = controller.colorHue(colorValue.text)
+                    if (hue >= 0)
+                        controller.fillTableHue(root.kind, root.applyCells(), hue)
+                }
+            }
             Rectangle { Layout.preferredWidth: 1; Layout.fillHeight: true; Layout.topMargin: 4; Layout.bottomMargin: 4; color: Theme.border }
             Text {
                 text: "ALL TICKED PARTICLES"
@@ -375,6 +386,17 @@ Item {
                 onClicked: controller.fillAppliedTables(
                     root.kind, root.colorMode ? colorValue.text : fillValue.text
                 )
+            }
+            PmButton {
+                visible: root.colorMode
+                text: "Apply Hue"
+                enabled: controller.applyParticleCount > 0
+                tooltip: "Apply the hue from the selected apply color to checked particles"
+                onClicked: {
+                    const hue = controller.colorHue(colorValue.text)
+                    if (hue >= 0)
+                        controller.fillAppliedTablesHue(root.kind, hue)
+                }
             }
             Item { Layout.fillWidth: true }
             Text {
@@ -410,6 +432,18 @@ Item {
                 tooltip: "Clear the current particle selection"
                 onClicked: controller.clearTableSelection(root.kind)
             }
+            PmButton {
+                text: "Undo Selection"
+                enabled: controller.canUndoSelection
+                tooltip: "Undo the last cell selection change"
+                onClicked: controller.undoSelection()
+            }
+            PmButton {
+                text: "Redo Selection"
+                enabled: controller.canRedoSelection
+                tooltip: "Redo the last cell selection change"
+                onClicked: controller.redoSelection()
+            }
         }
 
         Menu {
@@ -429,7 +463,18 @@ Item {
                     )
                     const rgb = controller.pickApplyColor(current)
                     if (rgb.length > 0)
-                        controller.setTableCell(root.kind, row, column, rgb)
+                        controller.fillTable(root.kind, root.applyCells(), rgb)
+                }
+            }
+            MenuItem {
+                text: "Hue Picker"
+                onTriggered: {
+                    if (colorCellMenu.targetRow < 0 || colorCellMenu.targetColumn < 0)
+                        return
+                    const current = root.tableModel.cellText(colorCellMenu.targetRow, colorCellMenu.targetColumn)
+                    const hue = controller.pickApplyHue(current)
+                    if (hue >= 0)
+                        controller.fillTableHue(root.kind, root.applyCells(), hue)
                 }
             }
         }
@@ -625,13 +670,28 @@ Item {
 
                 onPressed: function(mouse) {
                     const cell = root.cellAtPosition(mouse.x, mouse.y)
-                    if (cell[0] < 0)
+                    if (cell[0] < 0) {
+                        if (mouse.button === Qt.LeftButton && root.colorMode && cellSelection.selectedIndexes.length > 0) {
+                            cellSelection.clearSelection()
+                            root.syncSelection()
+                        }
                         return
+                    }
                     const index = root.tableModel.cellIndex(cell[0], cell[1])
                     if (mouse.button === Qt.RightButton) {
                         if (root.colorMode && cell[1] % 2 === 1) {
-                            cellSelection.clearSelection()
-                            cellSelection.select(index, ItemSelectionModel.Select)
+                            let selected = false
+                            const indexes = cellSelection.selectedIndexes
+                            for (let selectedIndex = 0; selectedIndex < indexes.length; ++selectedIndex) {
+                                if (indexes[selectedIndex].row === cell[0] && indexes[selectedIndex].column === cell[1]) {
+                                    selected = true
+                                    break
+                                }
+                            }
+                            if (!selected) {
+                                cellSelection.clearSelection()
+                                cellSelection.select(index, ItemSelectionModel.Select)
+                            }
                             cellSelection.setCurrentIndex(index, ItemSelectionModel.NoUpdate)
                             colorCellMenu.targetRow = cell[0]
                             colorCellMenu.targetColumn = cell[1]

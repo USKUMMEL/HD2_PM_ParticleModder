@@ -106,6 +106,26 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.controller.selectionFor("color"), selection)
         self.assertEqual(self.controller.colorPreset(0), selection)
 
+    def test_data_undo_and_selection_undo_are_separate(self):
+        graph = self.controller.color_model.graph_at(0)
+        original = list(graph.colors[0])
+        selection = [[0, 1], [0, 3]]
+
+        self.controller.updateSelection("color", selection)
+        self.controller.setTableCell("color", 0, 1, "10, 20, 30")
+
+        self.assertTrue(self.controller.canUndo)
+        self.assertTrue(self.controller.canUndoSelection)
+        self.controller.undo()
+        self.assertEqual(graph.colors[0], original)
+        self.assertEqual(self.controller.selectionFor("color"), selection)
+
+        self.controller.undoSelection()
+        self.assertEqual(self.controller.selectionFor("color"), [])
+        self.assertTrue(self.controller.canRedoSelection)
+        self.controller.redoSelection()
+        self.assertEqual(self.controller.selectionFor("color"), selection)
+
     def test_color_fill_applies_to_current_particle_only(self):
         second_effect = ParticleEffect.from_bytes(make_particle())
         second_document = Document(Path("second.particles"), second_effect, QUndoStack())
