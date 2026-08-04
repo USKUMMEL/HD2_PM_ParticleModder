@@ -1,6 +1,7 @@
 import os
 import json
 from pathlib import Path
+import struct
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from pm_particle_modder.application.controller import Document, ParticleControll
 from pm_particle_modder.core import (
     ArchiveEntry,
     ArchiveReader,
+    MATERIAL_TYPE_ID,
     PARTICLE_TYPE_ID,
     TEXTURE_TYPE_ID,
     ParticleEffect,
@@ -25,9 +27,13 @@ from test_particle import make_particle
 
 
 def particle_archive_entry(file_id: int, data: bytes) -> ArchiveEntry:
+    return archive_entry(file_id, PARTICLE_TYPE_ID, data)
+
+
+def archive_entry(file_id: int, type_id: int, data: bytes) -> ArchiveEntry:
     return ArchiveEntry(
         file_id=file_id,
-        type_id=PARTICLE_TYPE_ID,
+        type_id=type_id,
         toc_offset=0,
         stream_offset=0,
         gpu_offset=0,
@@ -431,6 +437,56 @@ class ControllerTests(unittest.TestCase):
             patch = ArchiveReader.open(Path(directory) / "9ba626afa44a3aa3.patch_0")
             particle_ids = [entry.file_id for entry in patch.entries_of_type(PARTICLE_TYPE_ID)]
             self.assertEqual(particle_ids, [first_id])
+
+    def test_patch_only_writes_assets_reachable_from_shield_enabled_particles(self):
+        first_id, second_id = 101, 202
+        first_material, second_material = 301, 302
+        first_texture, second_texture = 401, 402
+        source = make_particle()
+
+        def material_data(texture_id: int) -> bytes:
+            data = bytearray(148)
+            struct.pack_into("<I", data, 64, 1)
+            struct.pack_into("<Q", data, 140, texture_id)
+            return bytes(data)
+
+        with tempfile.TemporaryDirectory() as directory:
+            archive_path = Path(directory) / "source_archive"
+            write_patch_archive(archive_path, [
+                particle_archive_entry(first_id, source),
+                particle_archive_entry(second_id, source),
+                archive_entry(first_material, MATERIAL_TYPE_ID, material_data(first_texture)),
+                archive_entry(second_material, MATERIAL_TYPE_ID, material_data(second_texture)),
+                archive_entry(first_texture, TEXTURE_TYPE_ID, b"first texture"),
+                archive_entry(second_texture, TEXTURE_TYPE_ID, b"second texture"),
+            ])
+            archive = ArchiveReader.open(archive_path)
+            controller = ParticleController()
+            for particle_id, material_id in ((first_id, first_material), (second_id, second_material)):
+                particle_entry = archive.get_entry(particle_id, PARTICLE_TYPE_ID)
+                effect = ParticleEffect.from_bytes(particle_entry.toc_data)
+                effect.particle_systems[0].visualizer.material_id = material_id
+                controller.documents_model.append(Document(
+                    Path(f"{particle_id}.particles"), effect, QUndoStack(), archive=archive,
+                    archive_entry_id=particle_id, title=f"{particle_id}.particle",
+                    source_data=particle_entry.toc_data,
+                ))
+            archive.stage(archive.get_entry(first_material, MATERIAL_TYPE_ID))
+            archive.stage(archive.get_entry(second_material, MATERIAL_TYPE_ID))
+            archive.stage(archive.get_entry(first_texture, TEXTURE_TYPE_ID))
+            archive.stage(archive.get_entry(second_texture, TEXTURE_TYPE_ID))
+            controller.setCurrentDocument(0)
+            controller.togglePatchInclude(0)
+            controller.createPatch()
+            controller.writePatch()
+
+            patch = ArchiveReader.open(Path(directory) / "9ba626afa44a3aa3.patch_0")
+            self.assertIsNotNone(patch.get_entry(first_id, PARTICLE_TYPE_ID))
+            self.assertIsNone(patch.get_entry(second_id, PARTICLE_TYPE_ID))
+            self.assertIsNotNone(patch.get_entry(first_material, MATERIAL_TYPE_ID))
+            self.assertIsNone(patch.get_entry(second_material, MATERIAL_TYPE_ID))
+            self.assertIsNotNone(patch.get_entry(first_texture, TEXTURE_TYPE_ID))
+            self.assertIsNone(patch.get_entry(second_texture, TEXTURE_TYPE_ID))
 
     def test_patch_names_are_pm_sequence_and_ignore_existing_data_folder_patches(self):
         with tempfile.TemporaryDirectory() as directory:

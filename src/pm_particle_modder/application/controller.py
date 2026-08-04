@@ -380,11 +380,13 @@ class ParticleController(QObject):
     @Property(int, notify=stateChanged)
     def stagedChangeCount(self) -> int:
         included = sum(1 for document in self.documents_model.documents if document.include_in_patch)
+        included_resource_keys = self._included_particle_resource_keys()
         staged = sum(
             1
             for archive in self._archives_for_patch()
-            for _file_id, type_id in archive.staged_entries
-            if type_id != PARTICLE_TYPE_ID
+            for key, entry in archive.staged_entries.items()
+            if key in included_resource_keys.get(id(archive), set())
+            and self._should_write_staged_entry(archive, entry)
         )
         return included + staged
 
@@ -1483,6 +1485,7 @@ class ParticleController(QObject):
         target = self._patch_targets[self._selected_patch_index]
         archive = target.archive
         entries: dict[tuple[int, int], ArchiveEntry] = {}
+        included_resource_keys = self._included_particle_resource_keys()
         for document in self.documents_model.documents:
             if not document.include_in_patch:
                 continue
@@ -1497,7 +1500,10 @@ class ParticleController(QObject):
 
         for source_archive in self._archives_for_patch():
             for key, entry in source_archive.staged_entries.items():
-                if entry.type_id != PARTICLE_TYPE_ID and self._should_write_staged_entry(source_archive, entry):
+                if (
+                    key in included_resource_keys.get(id(source_archive), set())
+                    and self._should_write_staged_entry(source_archive, entry)
+                ):
                     entries[key] = entry
         if not entries and not target.needs_write:
             return
@@ -1563,6 +1569,28 @@ class ParticleController(QObject):
     def _mark_selected_patch_for_write(self) -> None:
         if self.hasSelectedPatch:
             self._patch_targets[self._selected_patch_index].needs_write = True
+
+    def _included_particle_resource_keys(self) -> dict[int, set[tuple[int, int]]]:
+        """Return material and texture resources reachable from shield-enabled particles."""
+        resources: dict[int, set[tuple[int, int]]] = {}
+        for document in self.documents_model.documents:
+            if not document.include_in_patch or document.archive is None:
+                continue
+            keys = resources.setdefault(id(document.archive), set())
+            material_ids = {
+                material_id
+                for _system_index, material_id in document.archive.particle_material_ids(document.effect)
+            }
+            keys.update((material_id, MATERIAL_TYPE_ID) for material_id in material_ids)
+            for material_id in material_ids:
+                try:
+                    entry = document.archive.find_entry(material_id, MATERIAL_TYPE_ID)
+                    material = parse_material(entry.toc_data) if entry is not None else None
+                except ArchiveError:
+                    material = None
+                if material is not None:
+                    keys.update((texture_id, TEXTURE_TYPE_ID) for texture_id in material.texture_ids)
+        return resources
 
     def _should_write_staged_entry(self, archive: ArchiveReader, entry: ArchiveEntry) -> bool:
         return (
