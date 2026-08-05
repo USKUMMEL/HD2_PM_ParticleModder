@@ -78,7 +78,7 @@ class ParticleEffectTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertTrue(changed.issubset(allowed))
 
-    def test_disabled_systems_are_serialized_as_non_rendering(self):
+    def test_disabled_systems_have_no_particle_capacity(self):
         source = make_two_system_particle()
         effect = ParticleEffect.from_bytes(source)
         self.assertEqual(len(effect.particle_systems), 2)
@@ -87,7 +87,8 @@ class ParticleEffectTests(unittest.TestCase):
         output = effect.to_bytes()
 
         self.assertEqual(struct.unpack_from("<I", output, 24)[0], 2)
-        self.assertEqual(struct.unpack_from("<I", output, 80 + 76)[0], 0xFFFFFFFF)
+        self.assertEqual(struct.unpack_from("<I", output, 80)[0], 0)
+        self.assertEqual(struct.unpack_from("<I", output, 80 + 76)[0], 0)
         self.assertEqual(len(ParticleEffect.from_bytes(output).particle_systems), 2)
 
     def test_rejects_unsupported_version(self):

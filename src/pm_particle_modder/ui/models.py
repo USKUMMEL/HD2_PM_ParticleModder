@@ -228,6 +228,7 @@ class VisualizerListModel(QAbstractListModel):
     EnabledRole = HasMeshRole + 1
     SystemIndexRole = EnabledRole + 1
     MeshArchiveRole = SystemIndexRole + 1
+    ToggleableRole = MeshArchiveRole + 1
 
     def __init__(self):
         super().__init__()
@@ -247,6 +248,7 @@ class VisualizerListModel(QAbstractListModel):
             self.EnabledRole: QByteArray(b"systemEnabled"),
             self.SystemIndexRole: QByteArray(b"systemIndex"),
             self.MeshArchiveRole: QByteArray(b"meshArchive"),
+            self.ToggleableRole: QByteArray(b"systemToggleable"),
         }
 
     def rowCount(self, parent=QModelIndex()):
@@ -275,6 +277,8 @@ class VisualizerListModel(QAbstractListModel):
             return visualizer is not None and visualizer.mesh_id is not None
         if role == self.EnabledRole:
             return system.enabled
+        if role == self.ToggleableRole:
+            return visualizer is not None
         if role == self.SystemIndexRole:
             return system.index
         if role == self.MeshArchiveRole:

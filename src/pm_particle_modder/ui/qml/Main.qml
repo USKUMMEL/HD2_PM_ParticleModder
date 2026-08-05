@@ -884,6 +884,7 @@ ApplicationWindow {
                                     required property bool hasUnit
                                     required property bool hasMesh
                                     required property bool systemEnabled
+                                    required property bool systemToggleable
                                     required property int systemIndex
                                     width: visualizerList.width - 12
                                     height: 74 + (hasMaterial ? 54 : 0) + (hasUnit ? 54 : 0) + (hasMesh ? 108 : 0)
@@ -902,6 +903,7 @@ ApplicationWindow {
                                             CheckBox {
                                                 id: systemEnabledToggle
                                                 checked: visualizerDelegate.systemEnabled
+                                                enabled: visualizerDelegate.systemToggleable
                                                 text: "Enabled"
                                                 onClicked: controller.toggleParticleSystem(visualizerDelegate.systemIndex)
                                             }

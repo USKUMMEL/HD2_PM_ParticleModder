@@ -209,11 +209,10 @@ class ParticleEffect:
                 graph.write_into(output)
 
         for system in self.particle_systems:
-            if not system.enabled:
-                # Stingray uses unk3 at +0x4C to mark a non-rendering particle system.
-                # Keeping its block and index intact avoids breaking systems that are
-                # referenced by trails or other runtime data later in the effect.
-                struct.pack_into("<I", output, system.offset + 76, 0xFFFFFFFF)
+            if not system.enabled and system.non_rendering == 0:
+                # Suppress user-disabled systems without changing their binary layout.
+                # Native non-rendering systems already use a different compact block.
+                struct.pack_into("<I", output, system.offset, 0)
         return bytes(output)
 
 
@@ -239,7 +238,7 @@ def _parse_particle_system(reader: BinaryReader, index: int) -> ParticleSystem:
     if not (0 <= component_list_offset <= emitter_offset <= visualizer_offset <= size):
         raise ParticleParseError(f"Particle system {index} has invalid chunk offsets.")
 
-    system = ParticleSystem(index, start, size, non_rendering)
+    system = ParticleSystem(index, start, size, non_rendering, enabled=non_rendering == 0)
     end = start + size
     if non_rendering == 0 and visualizer_offset != size:
         visualizer, component_start = _parse_visualizer(reader.data, start + visualizer_offset, end)

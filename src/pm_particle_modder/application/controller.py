@@ -1380,7 +1380,7 @@ class ParticleController(QObject):
         system = next(
             (item for item in document.effect.particle_systems if item.index == system_index), None
         )
-        if system is None:
+        if system is None or system.visualizer is None:
             return
         old_value = system.enabled
 
