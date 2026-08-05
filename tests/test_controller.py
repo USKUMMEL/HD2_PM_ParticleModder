@@ -619,6 +619,34 @@ class ControllerTests(unittest.TestCase):
         self.assertFalse(self.controller.selectedTextureUsesImported)
         self.assertFalse(self.controller._texture_patch_choices[(id(archive), texture_id)])
 
+    def test_standalone_particle_resolves_textures_from_the_active_archive(self):
+        material_id, texture_id = 301, 401
+        material_data = bytearray(148)
+        struct.pack_into("<I", material_data, 64, 1)
+        struct.pack_into("<Q", material_data, 140, texture_id)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive_path = root / "resources"
+            write_patch_archive(archive_path, [
+                archive_entry(material_id, MATERIAL_TYPE_ID, bytes(material_data)),
+                archive_entry(texture_id, TEXTURE_TYPE_ID, b"texture"),
+            ])
+            particle_path = root / "standalone.particle"
+            effect = ParticleEffect.from_bytes(make_particle())
+            effect.particle_systems[0].visualizer.material_id = material_id
+            particle_path.write_bytes(effect.to_bytes())
+            controller = ParticleController()
+            controller._archive = ArchiveReader.open(archive_path)
+
+            document = controller._open_particle(particle_path)
+            self.assertIsNotNone(document)
+            self.assertIs(document.resource_archive, controller._archive)
+
+            self.assertEqual(controller.texture_bindings_model.rowCount(), 1)
+            binding = controller.texture_bindings_model.binding_at(0)
+            self.assertEqual(binding.material_id, material_id)
+            self.assertEqual(binding.texture_id, texture_id)
+
     def test_groups_sort_files_and_preserve_current_document(self):
         second = Document(
             Path("zeta.particles"),

@@ -91,6 +91,30 @@ class ParticleEffectTests(unittest.TestCase):
         self.assertEqual(struct.unpack_from("<I", output, 80 + 76)[0], 0)
         self.assertEqual(len(ParticleEffect.from_bytes(output).particle_systems), 2)
 
+    def test_parses_variables_and_unedited_system_blocks(self):
+        source = bytearray(make_particle())
+        system = source[80:]
+        header = bytearray(96)
+        struct.pack_into("<Iff", header, 0, 0x73, 1.0, 3.0)
+        struct.pack_into("<II", header, 20, 1, 1)
+        struct.pack_into("<I", header, 80, 0xE783D2BD)
+        struct.pack_into("<3f", header, 84, 1.0, 2.0, 3.0)
+        struct.pack_into("<II", system, 4, 3, 0x10)
+        struct.pack_into("<2I", system, 12, 0x10, 0x04)
+        struct.pack_into("<3f", system, 168, 4.0, 5.0, 6.0)
+        effect = ParticleEffect.from_bytes(bytes(header + system))
+
+        self.assertEqual(effect.variables[0].name_hash, 0xE783D2BD)
+        self.assertEqual(effect.variables[0].default_value, (1.0, 2.0, 3.0))
+        parsed_system = effect.particle_systems[0]
+        self.assertEqual(parsed_system.max_num_particles, 100)
+        self.assertEqual(parsed_system.component_count, 3)
+        self.assertEqual(parsed_system.component_bit_flags, (0x10, 0x04, 0))
+        self.assertEqual(parsed_system.position, (4.0, 5.0, 6.0))
+        self.assertEqual(parsed_system.component_data.offset, parsed_system.offset + 260)
+        self.assertEqual(parsed_system.emitter_data.size, 0)
+        self.assertEqual(effect.to_bytes(), bytes(header + system))
+
     def test_rejects_unsupported_version(self):
         with self.assertRaisesRegex(ParticleParseError, "Unsupported particle version"):
             ParticleEffect.from_bytes(struct.pack("<I", 0x99) + bytes(100))

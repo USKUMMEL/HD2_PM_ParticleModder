@@ -96,6 +96,50 @@ class ColorGraph:
         struct.pack_into("<30f", output, self.colors_offset, *flattened)
 
 
+@dataclass(frozen=True)
+class ParticleVariable:
+    """A named vector default stored in the particle effect's variable table."""
+
+    name_hash: int
+    default_value: tuple[float, float, float]
+    hash_offset: int
+    value_offset: int
+
+
+@dataclass(frozen=True)
+class ParticleDataBlock:
+    """A read-only span of the original particle bytes."""
+
+    offset: int
+    size: int
+
+
+@dataclass(frozen=True)
+class EmitterMarker:
+    """A known emitter type signature found in an emitter payload.
+
+    A marker is deliberately not editable: type values can occur inside
+    unparsed emitter payloads as well as at record boundaries.
+    """
+
+    emitter_type: int
+    offset: int
+
+    TYPE_NAMES = {
+        0x03: "Unknown 1",
+        0x05: "Unknown 2",
+        0x0B: "Rate",
+        0x0C: "Burst",
+        0x19: "Unknown 3",
+        0x1C: "Unknown 0",
+        0x24: "Unknown 4",
+    }
+
+    @property
+    def type_name(self) -> str:
+        return self.TYPE_NAMES.get(self.emitter_type, f"Unknown {self.emitter_type}")
+
+
 @dataclass
 class Visualizer:
     visualizer_type: int
@@ -137,6 +181,16 @@ class ParticleSystem:
     offset: int
     size: int
     non_rendering: int
+    max_num_particles: int = 0
+    component_count: int = 0
+    component_header_type: int = 0
+    component_bit_flags: tuple[int, ...] = ()
+    header_values: tuple[int, ...] = ()
+    rotation_rows: tuple[tuple[float, float, float], ...] = ()
+    position: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    component_data: ParticleDataBlock | None = None
+    emitter_data: ParticleDataBlock | None = None
+    emitter_markers: tuple[EmitterMarker, ...] = ()
     visualizer: Visualizer | None = None
     scale_graphs: list[Graph] = field(default_factory=list)
     opacity_graphs: list[Graph] = field(default_factory=list)
@@ -154,6 +208,7 @@ class ParticleEffect:
     version: int
     min_lifetime: float
     max_lifetime: float
+    variables: list[ParticleVariable]
     particle_systems: list[ParticleSystem]
 
     @classmethod
@@ -176,10 +231,20 @@ class ParticleEffect:
             if version in {0x6F, 0x71, 0x72, 0x73}:
                 reader.skip(8)
 
+            variable_table_offset = reader.position
             variable_bytes = num_variables * (4 + 12)
-            if variable_bytes > len(data) - reader.position:
+            if variable_bytes > len(data) - variable_table_offset:
                 raise ParticleParseError("Variable table extends beyond the file.")
-            reader.skip(variable_bytes)
+            hashes = [reader.u32() for _ in range(num_variables)]
+            variables = [
+                ParticleVariable(
+                    name_hash,
+                    reader.unpack("<3f"),
+                    variable_table_offset + (index * 4),
+                    variable_table_offset + (num_variables * 4) + (index * 12),
+                )
+                for index, name_hash in enumerate(hashes)
+            ]
 
             systems = [
                 _parse_particle_system(reader, index)
@@ -188,7 +253,7 @@ class ParticleEffect:
         except struct.error as error:
             raise ParticleParseError(f"Invalid binary value: {error}") from error
 
-        return cls(data, version, min_lifetime, max_lifetime, systems)
+        return cls(data, version, min_lifetime, max_lifetime, variables, systems)
 
     def to_bytes(self) -> bytes:
         if not math.isfinite(self.min_lifetime) or not math.isfinite(self.max_lifetime):
@@ -221,11 +286,21 @@ def _parse_particle_system(reader: BinaryReader, index: int) -> ParticleSystem:
     if len(reader.data) - start < 260:
         raise ParticleParseError(f"Particle system {index} has a truncated header.")
 
-    reader.skip(4)  # max particles
-    reader.skip(4)  # component count
-    reader.skip(68)
+    max_num_particles = reader.u32()
+    component_count = reader.u32()
+    component_header = reader.read(68)
+    component_header_type = struct.unpack_from("<I", component_header)[0]
+    bit_flag_count = min(component_count, 16)
+    component_bit_flags = struct.unpack_from(f"<{bit_flag_count}I", component_header, 4)
     non_rendering = reader.u32()
-    reader.skip(40 + 48 + 12 + 52)
+    header_values = reader.unpack("<10I")
+    rotation_bytes = reader.read(48)
+    rotation_rows = tuple(
+        struct.unpack_from("<3f", rotation_bytes, row * 16)
+        for row in range(3)
+    )
+    position = reader.unpack("<3f")
+    reader.skip(52)
     component_list_offset = reader.u32()
     reader.skip(4)
     emitter_offset = reader.u32()
@@ -238,7 +313,25 @@ def _parse_particle_system(reader: BinaryReader, index: int) -> ParticleSystem:
     if not (0 <= component_list_offset <= emitter_offset <= visualizer_offset <= size):
         raise ParticleParseError(f"Particle system {index} has invalid chunk offsets.")
 
-    system = ParticleSystem(index, start, size, non_rendering, enabled=non_rendering == 0)
+    component_data = ParticleDataBlock(start + component_list_offset, emitter_offset - component_list_offset)
+    emitter_data = ParticleDataBlock(start + emitter_offset, visualizer_offset - emitter_offset)
+    system = ParticleSystem(
+        index,
+        start,
+        size,
+        non_rendering,
+        max_num_particles=max_num_particles,
+        component_count=component_count,
+        component_header_type=component_header_type,
+        component_bit_flags=component_bit_flags,
+        header_values=header_values,
+        rotation_rows=rotation_rows,
+        position=position,
+        component_data=component_data,
+        emitter_data=emitter_data,
+        emitter_markers=_find_emitter_markers(reader.data, emitter_data),
+        enabled=non_rendering == 0,
+    )
     end = start + size
     if non_rendering == 0 and visualizer_offset != size:
         visualizer, component_start = _parse_visualizer(reader.data, start + visualizer_offset, end)
@@ -247,6 +340,15 @@ def _parse_particle_system(reader: BinaryReader, index: int) -> ParticleSystem:
 
     reader.seek(end)
     return system
+
+
+def _find_emitter_markers(data: bytes, block: ParticleDataBlock) -> tuple[EmitterMarker, ...]:
+    markers = []
+    for offset in range(block.offset, block.offset + block.size - 3, 4):
+        emitter_type = struct.unpack_from("<I", data, offset)[0]
+        if emitter_type in EmitterMarker.TYPE_NAMES:
+            markers.append(EmitterMarker(emitter_type, offset))
+    return tuple(markers)
 
 
 def _parse_visualizer(data: bytes, offset: int, system_end: int) -> tuple[Visualizer, int]:

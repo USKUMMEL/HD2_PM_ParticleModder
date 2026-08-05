@@ -70,6 +70,7 @@ class Document:
         default_factory=lambda: [None, None]
     )
     archive: ArchiveReader | None = None
+    resource_archive: ArchiveReader | None = None
     archive_entry_id: int | None = None
     title: str = ""
     source_data: bytes = b""
@@ -348,9 +349,10 @@ class ParticleController(QObject):
     def selectedTextureUsesImported(self) -> bool:
         binding = self._selected_texture_binding()
         document = self.current_document
-        if binding is None or document is None or document.archive is None:
+        archive = self._resource_archive_for_document(document)
+        if binding is None or archive is None:
             return True
-        return self._texture_patch_choices.get((id(document.archive), binding.texture_id), True)
+        return self._texture_patch_choices.get((id(archive), binding.texture_id), True)
 
     @Property(str, notify=stateChanged)
     def texturePreviewMessage(self) -> str:
@@ -771,7 +773,15 @@ class ParticleController(QObject):
             return None
 
         stack = QUndoStack(self)
-        document = Document(path, effect, stack, note, group, source_data=effect.original_data)
+        document = Document(
+            path,
+            effect,
+            stack,
+            note,
+            group,
+            resource_archive=self._resolve_standalone_resource_archive(effect),
+            source_data=effect.original_data,
+        )
         stack.cleanChanged.connect(lambda _clean, doc=document: self._document_state_changed(doc))
         stack.canUndoChanged.connect(lambda _value: self.stateChanged.emit())
         stack.canRedoChanged.connect(lambda _value: self.stateChanged.emit())
@@ -780,6 +790,49 @@ class ParticleController(QObject):
         self.setCurrentDocument(row)
         self._set_status(f"Opened {path.name}")
         return document
+
+    def _resolve_standalone_resource_archive(self, effect: ParticleEffect) -> ArchiveReader | None:
+        resource_keys = []
+        for system in effect.particle_systems:
+            visualizer = system.visualizer
+            if visualizer is None:
+                continue
+            if visualizer.material_id is not None:
+                resource_keys.append((visualizer.material_id, MATERIAL_TYPE_ID))
+            if visualizer.unit_id is not None:
+                resource_keys.append((visualizer.unit_id, UNIT_TYPE_ID))
+        resource_keys = list(dict.fromkeys(resource_keys))
+        if not resource_keys:
+            return None
+
+        for archive in self._archives_for_patch():
+            try:
+                if any(archive.find_entry(file_id, type_id) is not None for file_id, type_id in resource_keys):
+                    return archive
+            except ArchiveError:
+                continue
+
+        if self._game_data_directory is None:
+            return None
+        try:
+            if (
+                self._slim_store is None
+                or self._slim_store.data_directory != self._game_data_directory
+            ):
+                self._slim_store = SlimArchiveStore(self._game_data_directory)
+            for file_id, type_id in resource_keys:
+                archive_id = self._slim_store.resource_archive_id(file_id, type_id)
+                if archive_id is not None:
+                    return self._slim_store.open_archive(archive_id)
+        except (OSError, ArchiveError):
+            return None
+        return None
+
+    @staticmethod
+    def _resource_archive_for_document(document: Document | None) -> ArchiveReader | None:
+        if document is None:
+            return None
+        return document.archive or document.resource_archive
 
     def _open_project(self, path: Path) -> None:
         missing = []
@@ -1122,7 +1175,11 @@ class ParticleController(QObject):
 
     def _archives_for_patch(self) -> list[ArchiveReader]:
         archives = []
-        for archive in [self._archive, *(document.archive for document in self.documents_model.documents)]:
+        for archive in [
+            self._archive,
+            *(document.archive for document in self.documents_model.documents),
+            *(document.resource_archive for document in self.documents_model.documents),
+        ]:
             if archive is not None and not any(archive is existing for existing in archives):
                 archives.append(archive)
         return archives
@@ -1213,10 +1270,9 @@ class ParticleController(QObject):
             self.stateChanged.emit()
             return
         binding = self.texture_bindings_model.binding_at(self._selected_texture_index)
-        document = self.current_document
-        archive = document.archive if document is not None else None
+        archive = self._resource_archive_for_document(self.current_document)
         if archive is None:
-            self._texture_preview_message = "This particle is not backed by an archive."
+            self._texture_preview_message = "Texture resources could not be resolved for this particle."
             self.stateChanged.emit()
             return
         self._texture_preview_message = "Loading texture..."
@@ -1304,7 +1360,7 @@ class ParticleController(QObject):
         texture_id = self._selected_texture_id()
         binding = self._selected_texture_binding()
         document = self.current_document
-        archive = document.archive if document is not None else None
+        archive = self._resource_archive_for_document(document)
         if texture_id is None or archive is None:
             return
         path, _ = QFileDialog.getOpenFileName(None, "Replace texture from PNG", "", "PNG (*.png)")
@@ -1326,7 +1382,7 @@ class ParticleController(QObject):
         texture_id = self._selected_texture_id()
         binding = self._selected_texture_binding()
         document = self.current_document
-        archive = document.archive if document is not None else None
+        archive = self._resource_archive_for_document(document)
         if texture_id is None or archive is None:
             return
         path, _ = QFileDialog.getOpenFileName(None, "Replace texture from DDS", "", "DDS (*.dds)")
@@ -1363,9 +1419,10 @@ class ParticleController(QObject):
     def setSelectedTexturePatchVersion(self, use_imported: bool) -> None:
         binding = self._selected_texture_binding()
         document = self.current_document
-        if binding is None or document is None or document.archive is None:
+        archive = self._resource_archive_for_document(document)
+        if binding is None or archive is None:
             return
-        key = (id(document.archive), binding.texture_id)
+        key = (id(archive), binding.texture_id)
         if self._texture_patch_choices.get(key, True) == use_imported:
             return
         self._texture_patch_choices[key] = use_imported
@@ -1424,8 +1481,9 @@ class ParticleController(QObject):
             if texture_id in document.modified_texture_ids:
                 document.modified_texture_ids.discard(texture_id)
                 self.documents_model.refresh(self.documents_model.documents.index(document))
-            if document.archive is not None:
-                self._texture_patch_choices.pop((id(document.archive), texture_id), None)
+            archive = self._resource_archive_for_document(document)
+            if archive is not None:
+                self._texture_patch_choices.pop((id(archive), texture_id), None)
 
     def _reset_document_texture_replacements(self, document: Document) -> None:
         for texture_id in tuple(document.modified_texture_ids):
@@ -1574,17 +1632,18 @@ class ParticleController(QObject):
         """Return material and texture resources reachable from shield-enabled particles."""
         resources: dict[int, set[tuple[int, int]]] = {}
         for document in self.documents_model.documents:
-            if not document.include_in_patch or document.archive is None:
+            archive = self._resource_archive_for_document(document)
+            if not document.include_in_patch or archive is None:
                 continue
-            keys = resources.setdefault(id(document.archive), set())
+            keys = resources.setdefault(id(archive), set())
             material_ids = {
                 material_id
-                for _system_index, material_id in document.archive.particle_material_ids(document.effect)
+                for _system_index, material_id in archive.particle_material_ids(document.effect)
             }
             keys.update((material_id, MATERIAL_TYPE_ID) for material_id in material_ids)
             for material_id in material_ids:
                 try:
-                    entry = document.archive.find_entry(material_id, MATERIAL_TYPE_ID)
+                    entry = archive.find_entry(material_id, MATERIAL_TYPE_ID)
                     material = parse_material(entry.toc_data) if entry is not None else None
                 except ArchiveError:
                     material = None
@@ -1625,8 +1684,7 @@ class ParticleController(QObject):
 
     def _selected_texture_entry(self):
         binding = self._selected_texture_binding()
-        document = self.current_document
-        archive = document.archive if document is not None else None
+        archive = self._resource_archive_for_document(self.current_document)
         if binding is None or archive is None:
             return None, None
         try:
@@ -1642,15 +1700,16 @@ class ParticleController(QObject):
 
     def _refresh_assets(self) -> None:
         document = self.current_document
-        if document is not None and document.archive is not None:
-            self.asset_links_model.set_links(document.archive.particle_assets(document.effect))
-            self._all_texture_bindings = document.archive.texture_bindings(document.effect)
+        archive = self._resource_archive_for_document(document)
+        if document is not None and archive is not None:
+            self.asset_links_model.set_links(archive.particle_assets(document.effect))
+            self._all_texture_bindings = archive.texture_bindings(document.effect)
             self._texture_materials_by_system = {}
             textured_materials = {
                 (binding.system_index, binding.material_id)
                 for binding in self._all_texture_bindings
             }
-            particle_material_ids = document.archive.particle_material_ids(document.effect)
+            particle_material_ids = archive.particle_material_ids(document.effect)
             self._material_ids_by_system = {}
             for system_index, material_id in particle_material_ids:
                 self._material_ids_by_system.setdefault(system_index, []).append(material_id)
@@ -1693,11 +1752,12 @@ class ParticleController(QObject):
 
     def _refresh_material_variables(self) -> None:
         document = self.current_document
-        if document is None or document.archive is None or self._selected_material_id < 0:
+        archive = self._resource_archive_for_document(document)
+        if document is None or archive is None or self._selected_material_id < 0:
             self.material_variable_model.set_variables([])
             return
         try:
-            entry = document.archive.find_entry(self._selected_material_id, MATERIAL_TYPE_ID)
+            entry = archive.find_entry(self._selected_material_id, MATERIAL_TYPE_ID)
             material = parse_material(entry.toc_data) if entry is not None else None
         except ArchiveError:
             material = None
@@ -1725,17 +1785,18 @@ class ParticleController(QObject):
     @Slot(int, int, str)
     def setMaterialVariableValue(self, variable_index: int, value_index: int, text: str) -> None:
         document = self.current_document
-        if document is None or document.archive is None or self._selected_material_id < 0:
+        archive = self._resource_archive_for_document(document)
+        if document is None or archive is None or self._selected_material_id < 0:
             return
         try:
             value = float(text)
             if not math.isfinite(value):
                 raise ValueError
             variable = self.material_variable_model.variables[variable_index]
-            entry = document.archive.find_entry(self._selected_material_id, MATERIAL_TYPE_ID)
+            entry = archive.find_entry(self._selected_material_id, MATERIAL_TYPE_ID)
             if entry is None:
                 raise ArchiveError("Material resource was not found.")
-            document.archive.stage(replace_material_variable(entry, variable, value_index, value))
+            archive.stage(replace_material_variable(entry, variable, value_index, value))
         except (ValueError, IndexError, ArchiveError):
             self._refresh_material_variables()
             return
@@ -1746,7 +1807,8 @@ class ParticleController(QObject):
     @Slot(int)
     def pickMaterialVariableColor(self, variable_index: int) -> None:
         document = self.current_document
-        if document is None or document.archive is None or self._selected_material_id < 0:
+        archive = self._resource_archive_for_document(document)
+        if document is None or archive is None or self._selected_material_id < 0:
             return
         try:
             variable = self.material_variable_model.variables[variable_index]
@@ -1754,12 +1816,12 @@ class ParticleController(QObject):
             color = QColorDialog.getColor(initial, None, "Material shader color")
             if not color.isValid():
                 return
-            entry = document.archive.find_entry(self._selected_material_id, MATERIAL_TYPE_ID)
+            entry = archive.find_entry(self._selected_material_id, MATERIAL_TYPE_ID)
             if entry is None:
                 raise ArchiveError("Material resource was not found.")
             for value_index, value in enumerate((color.redF(), color.greenF(), color.blueF())):
                 entry = replace_material_variable(entry, variable, value_index, value)
-            document.archive.stage(entry)
+            archive.stage(entry)
         except (IndexError, ArchiveError):
             self._refresh_material_variables()
             return
@@ -1768,10 +1830,11 @@ class ParticleController(QObject):
         self._set_status(f"Staged material {self._selected_material_id}")
 
     def _mesh_archive_locations(self, document: Document | None) -> dict[int, str]:
-        if document is None or document.archive is None:
+        archive = self._resource_archive_for_document(document)
+        if document is None or archive is None:
             return {}
         locations: dict[int, str] = {}
-        archives = [document.archive, *self._archives_for_patch()]
+        archives = [archive, *self._archives_for_patch()]
         for system in document.effect.particle_systems:
             visualizer = system.visualizer
             if visualizer is None or visualizer.mesh_id is None or visualizer.unit_id is None:
@@ -1789,8 +1852,7 @@ class ParticleController(QObject):
         self._texture_overview_request += 1
         request_id = self._texture_overview_request
         self._texture_overview_pool.clear()
-        document = self.current_document
-        archive = document.archive if document is not None else None
+        archive = self._resource_archive_for_document(self.current_document)
         if archive is None:
             return
         pending = [
@@ -1856,7 +1918,7 @@ class ParticleController(QObject):
         self.color_model.set_effect(effect)
         self.opacity_model.set_effect(effect)
         self.intensity_model.set_effect(effect)
-        active_archive = self.current_document.archive if self.current_document else None
+        active_archive = self._resource_archive_for_document(self.current_document)
         for archive in self._archives_for_patch():
             if archive is not active_archive and hasattr(archive, "clear_payload_cache"):
                 archive.clear_payload_cache()
