@@ -481,6 +481,158 @@ class MaterialVariableListModel(QAbstractListModel):
         self.endResetModel()
 
 
+class HexViewerModel(QAbstractListModel):
+    """Virtualised, read-only rows for the particle research hex viewer."""
+
+    OffsetRole = Qt.ItemDataRole.UserRole + 1
+    CellsRole = OffsetRole + 1
+    AsciiRole = CellsRole + 1
+
+    def __init__(self):
+        super().__init__()
+        self._data = b""
+        self._base_offset = 0
+        self._patterns: list[dict] = []
+        self._safe_patterns: list[dict] = []
+        self._selected_pattern = -1
+        self._selected_offset = -1
+        self._selection_start = -1
+        self._selection_end = -1
+        self._highlights_visible = True
+        self._safe_regions_visible = False
+
+    def roleNames(self):
+        return {
+            self.OffsetRole: QByteArray(b"hexOffset"),
+            self.CellsRole: QByteArray(b"hexCells"),
+            self.AsciiRole: QByteArray(b"asciiText"),
+        }
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else (len(self._data) + 15) // 16
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or not 0 <= index.row() < self.rowCount():
+            return None
+        row_start = index.row() * 16
+        if role == self.OffsetRole:
+            return f"{self._base_offset + row_start:08X}"
+        if role == self.CellsRole:
+            return [self._cell(row_start + column) for column in range(16)]
+        if role == self.AsciiRole:
+            return "".join(
+                chr(value) if 32 <= value <= 126 else "."
+                for value in self._data[row_start:row_start + 16]
+            )
+        return None
+
+    def set_content(
+        self,
+        data: bytes,
+        base_offset: int,
+        patterns: list[dict],
+        safe_patterns: list[dict] | None = None,
+    ) -> None:
+        self.beginResetModel()
+        self._data = bytes(data)
+        self._base_offset = base_offset
+        self._patterns = list(patterns)
+        self._safe_patterns = list(safe_patterns or [])
+        self._selected_pattern = -1
+        self._selected_offset = -1
+        self._selection_start = -1
+        self._selection_end = -1
+        self.endResetModel()
+
+    def set_selected_pattern(self, pattern_index: int) -> None:
+        selected = pattern_index if 0 <= pattern_index < len(self._patterns) else -1
+        if selected == self._selected_pattern:
+            return
+        self._selected_pattern = selected
+        if self.rowCount():
+            self.dataChanged.emit(
+                self.index(0, 0), self.index(self.rowCount() - 1, 0), [self.CellsRole]
+            )
+
+    def set_selected_offset(self, absolute_offset: int) -> None:
+        selected = absolute_offset if self._base_offset <= absolute_offset < self._base_offset + len(self._data) else -1
+        if selected == self._selected_offset:
+            return
+        self._selected_offset = selected
+        if self.rowCount():
+            self.dataChanged.emit(
+                self.index(0, 0), self.index(self.rowCount() - 1, 0), [self.CellsRole]
+            )
+
+    def set_selection_range(self, start: int, end: int) -> None:
+        if not (
+            self._base_offset <= start < self._base_offset + len(self._data)
+            and self._base_offset <= end < self._base_offset + len(self._data)
+        ):
+            start = end = -1
+        if (start, end) == (self._selection_start, self._selection_end):
+            return
+        self._selection_start = start
+        self._selection_end = end
+        if self.rowCount():
+            self.dataChanged.emit(
+                self.index(0, 0), self.index(self.rowCount() - 1, 0), [self.CellsRole]
+            )
+
+    def set_highlights_visible(self, visible: bool) -> None:
+        if visible == self._highlights_visible:
+            return
+        self._highlights_visible = visible
+        if self.rowCount():
+            self.dataChanged.emit(
+                self.index(0, 0), self.index(self.rowCount() - 1, 0), [self.CellsRole]
+            )
+
+    def set_safe_regions_visible(self, visible: bool) -> None:
+        if visible == self._safe_regions_visible:
+            return
+        self._safe_regions_visible = visible
+        if self.rowCount():
+            self.dataChanged.emit(
+                self.index(0, 0), self.index(self.rowCount() - 1, 0), [self.CellsRole]
+            )
+
+    def _cell(self, relative_offset: int) -> dict:
+        if not 0 <= relative_offset < len(self._data):
+            return {"text": "", "color": "#68707C", "selected": False, "active": False, "safe": False, "safeLabel": "", "offset": -1, "pattern": ""}
+        absolute_offset = self._base_offset + relative_offset
+        pattern_index, pattern = self._pattern_at(absolute_offset)
+        safe_pattern = self._safe_pattern_at(absolute_offset)
+        range_start, range_end = sorted((self._selection_start, self._selection_end))
+        return {
+            "text": f"{self._data[relative_offset]:02X}",
+            "color": pattern.get("color", "#B9C2CD") if pattern else "#B9C2CD",
+            "selected": pattern_index == self._selected_pattern,
+            "active": absolute_offset == self._selected_offset,
+            "rangeSelected": range_start <= absolute_offset <= range_end,
+            "safe": safe_pattern is not None and self._safe_regions_visible,
+            "safeLabel": safe_pattern.get("label", "") if safe_pattern and self._safe_regions_visible else "",
+            "offset": absolute_offset,
+            "pattern": pattern.get("label", "") if pattern else "",
+        }
+
+    def _pattern_at(self, offset: int):
+        # Later, more specific patterns intentionally override broad parent ranges.
+        result = (-1, None)
+        for index, pattern in enumerate(self._patterns):
+            start = pattern["offset"]
+            if start <= offset < start + pattern["size"]:
+                result = (index, pattern)
+        return result
+
+    def _safe_pattern_at(self, offset: int):
+        for pattern in self._safe_patterns:
+            start = pattern["offset"]
+            if start <= offset < start + pattern["size"]:
+                return pattern
+        return None
+
+
 class TextureBindingListModel(QAbstractListModel):
     SystemRole = Qt.ItemDataRole.UserRole + 1
     MaterialRole = SystemRole + 1

@@ -113,6 +113,19 @@ class ParticleDataBlock:
     offset: int
     size: int
 
+    @property
+    def end(self) -> int:
+        return self.offset + self.size
+
+
+@dataclass(frozen=True)
+class ParticleSlot:
+    """One field in the runtime particle record, with neutral semantics."""
+
+    index: int
+    offset: int
+    width: int
+
 
 @dataclass(frozen=True)
 class EmitterMarker:
@@ -183,13 +196,14 @@ class ParticleSystem:
     non_rendering: int
     max_num_particles: int = 0
     component_count: int = 0
-    component_header_type: int = 0
-    component_bit_flags: tuple[int, ...] = ()
+    particle_stride: int = 0
+    slot_widths: tuple[int, ...] = ()
     header_values: tuple[int, ...] = ()
     rotation_rows: tuple[tuple[float, float, float], ...] = ()
     position: tuple[float, float, float] = (0.0, 0.0, 0.0)
-    component_data: ParticleDataBlock | None = None
+    behavior_data: ParticleDataBlock | None = None
     emitter_data: ParticleDataBlock | None = None
+    visualizer_data: ParticleDataBlock | None = None
     emitter_markers: tuple[EmitterMarker, ...] = ()
     visualizer: Visualizer | None = None
     scale_graphs: list[Graph] = field(default_factory=list)
@@ -200,6 +214,36 @@ class ParticleSystem:
     @property
     def is_rendering(self) -> bool:
         return self.non_rendering == 0
+
+    @property
+    def slots(self) -> tuple[ParticleSlot, ...]:
+        return build_slot_layout(self.slot_widths)
+
+    @property
+    def header_size(self) -> int:
+        return self.behavior_data.offset - self.offset if self.behavior_data is not None else 0
+
+    # Compatibility aliases for older PM code and projects.
+    @property
+    def component_header_type(self) -> int:
+        return self.particle_stride
+
+    @property
+    def component_bit_flags(self) -> tuple[int, ...]:
+        return self.slot_widths
+
+    @property
+    def component_data(self) -> ParticleDataBlock | None:
+        return self.behavior_data
+
+
+def build_slot_layout(widths: tuple[int, ...]) -> tuple[ParticleSlot, ...]:
+    offset = 0
+    slots = []
+    for index, width in enumerate(widths):
+        slots.append(ParticleSlot(index, offset, width))
+        offset += width
+    return tuple(slots)
 
 
 @dataclass
@@ -247,7 +291,7 @@ class ParticleEffect:
             ]
 
             systems = [
-                _parse_particle_system(reader, index)
+                _parse_particle_system(reader, index, version)
                 for index in range(num_systems)
             ]
         except struct.error as error:
@@ -281,17 +325,18 @@ class ParticleEffect:
         return bytes(output)
 
 
-def _parse_particle_system(reader: BinaryReader, index: int) -> ParticleSystem:
+def _parse_particle_system(reader: BinaryReader, index: int, version: int) -> ParticleSystem:
     start = reader.position
-    if len(reader.data) - start < 260:
+    if len(reader.data) - start < 0x104:
         raise ParticleParseError(f"Particle system {index} has a truncated header.")
 
     max_num_particles = reader.u32()
     component_count = reader.u32()
     component_header = reader.read(68)
-    component_header_type = struct.unpack_from("<I", component_header)[0]
-    bit_flag_count = min(component_count, 16)
-    component_bit_flags = struct.unpack_from(f"<{bit_flag_count}I", component_header, 4)
+    particle_stride = struct.unpack_from("<I", component_header)[0]
+    if component_count > 16:
+        raise ParticleParseError(f"Particle system {index} has unsupported slot count {component_count}.")
+    slot_widths = struct.unpack_from(f"<{component_count}I", component_header, 4)
     non_rendering = reader.u32()
     header_values = reader.unpack("<10I")
     rotation_bytes = reader.read(48)
@@ -308,12 +353,17 @@ def _parse_particle_system(reader: BinaryReader, index: int) -> ParticleSystem:
     visualizer_offset = reader.u32()
     size = reader.u32()
 
-    if size < 260 or start + size > len(reader.data):
+    if size < 0x104 or start + size > len(reader.data):
         raise ParticleParseError(f"Particle system {index} has invalid size 0x{size:X}.")
-    if not (0 <= component_list_offset <= emitter_offset <= visualizer_offset <= size):
+    if not (0x104 <= component_list_offset <= emitter_offset <= visualizer_offset <= size):
         raise ParticleParseError(f"Particle system {index} has invalid chunk offsets.")
+    if version == CURRENT_PARTICLE_VERSION and particle_stride != sum(slot_widths):
+        raise ParticleParseError(
+            f"Particle system {index}: stride 0x{particle_stride:X} does not match "
+            f"slot-width sum 0x{sum(slot_widths):X}."
+        )
 
-    component_data = ParticleDataBlock(start + component_list_offset, emitter_offset - component_list_offset)
+    behavior_data = ParticleDataBlock(start + component_list_offset, emitter_offset - component_list_offset)
     emitter_data = ParticleDataBlock(start + emitter_offset, visualizer_offset - emitter_offset)
     system = ParticleSystem(
         index,
@@ -322,12 +372,12 @@ def _parse_particle_system(reader: BinaryReader, index: int) -> ParticleSystem:
         non_rendering,
         max_num_particles=max_num_particles,
         component_count=component_count,
-        component_header_type=component_header_type,
-        component_bit_flags=component_bit_flags,
+        particle_stride=particle_stride,
+        slot_widths=slot_widths,
         header_values=header_values,
         rotation_rows=rotation_rows,
         position=position,
-        component_data=component_data,
+        behavior_data=behavior_data,
         emitter_data=emitter_data,
         emitter_markers=_find_emitter_markers(reader.data, emitter_data),
         enabled=non_rendering == 0,
@@ -336,7 +386,8 @@ def _parse_particle_system(reader: BinaryReader, index: int) -> ParticleSystem:
     if non_rendering == 0 and visualizer_offset != size:
         visualizer, component_start = _parse_visualizer(reader.data, start + visualizer_offset, end)
         system.visualizer = visualizer
-        _parse_components(reader.data, component_start, end, system)
+        system.visualizer_data = ParticleDataBlock(start + visualizer_offset, component_start - (start + visualizer_offset))
+        _parse_visualizer_components(reader.data, component_start, end, system)
 
     reader.seek(end)
     return system
@@ -385,7 +436,7 @@ def _parse_visualizer(data: bytes, offset: int, system_end: int) -> tuple[Visual
     return visualizer, offset + size
 
 
-def _parse_components(
+def _parse_visualizer_components(
     data: bytes,
     position: int,
     system_end: int,

@@ -80,6 +80,121 @@ class ControllerTests(unittest.TestCase):
         self.controller.redo()
         self.assertEqual(graph.y[1], 0.5)
 
+    def test_hex_viewer_marks_parsed_particle_ranges(self):
+        patterns = self.controller.hexPatternOptions
+        labels = [item["label"] for item in patterns]
+
+        self.assertGreater(self.controller.hex_viewer_model.rowCount(), 0)
+        self.assertIn("Particle header & tables", labels)
+        self.assertIn("System 1: header", labels)
+        self.assertIn("System 1: color graph 1", labels)
+
+        self.controller.selectHexScope(1)
+        self.assertEqual(self.controller.hexScopeOptions[1], "Particle System 1")
+        system_size = self.document.effect.particle_systems[0].size
+        self.assertEqual(self.controller.hex_viewer_model.rowCount(), (system_size + 15) // 16)
+        self.controller.selectHexPattern(1)
+        self.assertEqual(self.controller.selectedHexRow, 0)
+
+        self.controller.selectHexScope(0)
+        self.controller.selectHexByte(6)
+        self.assertEqual(self.controller.selectedHexValue, "80")
+        self.assertIn("Abs 0x6", self.controller.hexInspectorSummary)
+        self.assertIn("u32 1065353216", self.controller.hexInspectorSummary)
+        self.assertTrue(self.controller.applySelectedHexByte("00"))
+        self.assertEqual(struct.unpack_from("<f", self.document.effect.to_bytes(), 4)[0], 0.5)
+        self.controller.undo()
+        self.assertEqual(struct.unpack_from("<f", self.document.effect.to_bytes(), 4)[0], 1.0)
+
+        self.controller.beginHexSelection(4)
+        self.controller.extendHexSelection(7)
+        self.assertEqual(self.controller.hexSelectionSize, 4)
+        self.assertEqual(self.controller.selectedHexRange, "0x4 - 0x7 (4 bytes)")
+        self.controller.clearHexSelection()
+        self.assertFalse(self.controller.hasHexSelection)
+        self.controller.beginHexSelection(4)
+        self.controller.extendHexSelection(7)
+        self.controller.copyHexSelection()
+        self.assertEqual(QApplication.clipboard().text(), "00 00 80 3F")
+        self.assertTrue(self.controller.pasteHexBytes("00 00 00 00"))
+        self.assertEqual(struct.unpack_from("<f", self.document.effect.to_bytes(), 4)[0], 0.0)
+        self.controller.undo()
+        self.assertEqual(struct.unpack_from("<f", self.document.effect.to_bytes(), 4)[0], 1.0)
+
+        self.assertTrue(self.controller.applySelectedHexByte("00"))
+        self.assertTrue(self.controller.copyHexSelectionTo(8))
+        self.assertEqual(struct.unpack_from("<f", self.document.effect.to_bytes(), 8)[0], 0.0)
+        self.controller.undo()
+        self.controller.undo()
+        self.assertEqual(struct.unpack_from("<ff", self.document.effect.to_bytes(), 4), (1.0, 3.0))
+
+        self.assertFalse(self.controller.hexHighlightsVisible)
+        cells = self.controller.hex_viewer_model.data(
+            self.controller.hex_viewer_model.index(0, 0),
+            self.controller.hex_viewer_model.CellsRole,
+        )
+        self.assertFalse(cells[4]["safe"])
+        self.controller.toggleHexHighlights()
+        self.assertTrue(self.controller.hexHighlightsVisible)
+        self.assertIn("Minimum particle lifetime", self.controller.hexSafeRegionNoteAt(4))
+        cells = self.controller.hex_viewer_model.data(
+            self.controller.hex_viewer_model.index(0, 0),
+            self.controller.hex_viewer_model.CellsRole,
+        )
+        self.assertTrue(cells[4]["safe"])
+        self.controller.toggleHexHighlights()
+        self.assertFalse(self.controller.hexHighlightsVisible)
+
+    def test_hex_viewer_compares_another_open_particle(self):
+        comparison = Document(
+            Path("comparison.particles"), ParticleEffect.from_bytes(make_particle()), QUndoStack()
+        )
+        self.controller.documents_model.append(comparison)
+
+        self.assertEqual(self.controller.hexCompareParticleOptions, ["No comparison", "comparison.particles [2]"])
+        self.controller.selectHexCompareParticle(1)
+        self.assertTrue(self.controller.hasHexComparison)
+        self.assertEqual(self.controller.hexCompareTitle, "comparison.particles")
+        self.assertGreater(self.controller.hex_compare_viewer_model.rowCount(), 0)
+
+        self.controller.selectHexCompareScope(1)
+        system_size = comparison.effect.particle_systems[0].size
+        self.assertEqual(self.controller.hex_compare_viewer_model.rowCount(), (system_size + 15) // 16)
+
+        self.controller.setCurrentDocument(1)
+        self.assertTrue(self.controller.hasHexComparison)
+        self.assertEqual(self.controller.hexCompareTitle, "fixture.particles")
+
+    def test_hex_word_diff_transplants_exactly_one_word(self):
+        comparison_data = bytearray(make_particle())
+        visualizer_offset = self.document.effect.particle_systems[0].visualizer_data.offset
+        struct.pack_into("<f", comparison_data, visualizer_offset + 4, 0.75)
+        comparison = Document(
+            Path("comparison.particles"), ParticleEffect.from_bytes(bytes(comparison_data)), QUndoStack()
+        )
+        self.controller.documents_model.append(comparison)
+
+        self.controller.selectHexScope(1)
+        self.controller.selectHexCompareParticle(1)
+        self.controller.selectHexCompareScope(1)
+
+        self.assertTrue(self.controller.hasHexSystemDiff)
+        self.assertIn("Compatibility: Exact", self.controller.hexCompatibilitySummary)
+        self.controller.selectHexDiffBlock(
+            self.controller.hexDiffBlockOptions.index("Visualizer")
+        )
+        differences = self.controller.hexWordDifferences
+        self.assertEqual(len(differences), 1)
+        self.assertEqual(differences[0]["relativeOffset"], "+0x4")
+        before = self.document.effect.to_bytes()
+        self.assertTrue(self.controller.transplantHexWordDifference(0))
+        after = self.document.effect.to_bytes()
+        changed = [index for index, pair in enumerate(zip(before, after)) if pair[0] != pair[1]]
+        self.assertTrue(changed)
+        self.assertTrue(set(changed).issubset(range(visualizer_offset + 4, visualizer_offset + 8)))
+        self.controller.undo()
+        self.assertEqual(self.document.effect.to_bytes(), before)
+
     def test_fill_selection_is_one_undo_step(self):
         graph = self.controller.opacity_model.graph_at(0)
         original = [graph.y[0], graph.y[1], graph.y[2]]
@@ -438,6 +553,49 @@ class ControllerTests(unittest.TestCase):
             particle_ids = [entry.file_id for entry in patch.entries_of_type(PARTICLE_TYPE_ID)]
             self.assertEqual(particle_ids, [first_id])
 
+    def test_particle_swap_writes_source_data_at_target_id_with_assets(self):
+        source_id, target_id = 101, 202
+        material_id, texture_id = 301, 401
+        source = make_particle()
+
+        def material_data(texture: int) -> bytes:
+            data = bytearray(148)
+            struct.pack_into("<I", data, 64, 1)
+            struct.pack_into("<Q", data, 140, texture)
+            return bytes(data)
+
+        with tempfile.TemporaryDirectory() as directory:
+            archive_path = Path(directory) / "source_archive"
+            write_patch_archive(archive_path, [
+                particle_archive_entry(source_id, source),
+                particle_archive_entry(target_id, source),
+                archive_entry(material_id, MATERIAL_TYPE_ID, material_data(texture_id)),
+                archive_entry(texture_id, TEXTURE_TYPE_ID, b"texture"),
+            ])
+            archive = ArchiveReader.open(archive_path)
+            effect = ParticleEffect.from_bytes(archive.get_entry(source_id, PARTICLE_TYPE_ID).toc_data)
+            effect.min_lifetime = 2.0
+            effect.particle_systems[0].visualizer.material_id = material_id
+            controller = ParticleController()
+            controller.documents_model.append(Document(
+                Path(f"{source_id}.particles"), effect, QUndoStack(), archive=archive,
+                archive_entry_id=source_id, source_data=source,
+            ))
+            controller.setCurrentDocument(0)
+
+            self.assertTrue(controller.createParticleSwap(0, str(target_id), True))
+            self.assertEqual(controller.particleSwapCount, 1)
+            controller.createPatch()
+            controller.writePatch()
+
+            patch = ArchiveReader.open(Path(directory) / "9ba626afa44a3aa3.patch_0")
+            target = patch.get_entry(target_id, PARTICLE_TYPE_ID)
+            self.assertIsNotNone(target)
+            self.assertEqual(target.toc_data, effect.to_bytes())
+            self.assertIsNone(patch.get_entry(source_id, PARTICLE_TYPE_ID))
+            self.assertIsNotNone(patch.get_entry(material_id, MATERIAL_TYPE_ID))
+            self.assertIsNotNone(patch.get_entry(texture_id, TEXTURE_TYPE_ID))
+
     def test_patch_only_writes_assets_reachable_from_shield_enabled_particles(self):
         first_id, second_id = 101, 202
         first_material, second_material = 301, 302
@@ -682,6 +840,27 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), self.document.effect.to_bytes())
             self.assertTrue(self.document.undo_stack.isClean())
             self.assertEqual(self.document.path, target.resolve())
+
+    def test_exports_original_or_edited_particle_without_changing_document_state(self):
+        self.controller.setLifetime("min", "2")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original_target = root / "original.particles"
+            edited_target = root / "edited.particles"
+            with patch(
+                "pm_particle_modder.application.controller.QFileDialog.getSaveFileName",
+                return_value=(str(original_target), "Particle Files (*.particles)"),
+            ):
+                self.assertTrue(self.controller.exportParticles([0], False))
+            with patch(
+                "pm_particle_modder.application.controller.QFileDialog.getSaveFileName",
+                return_value=(str(edited_target), "Particle Files (*.particles)"),
+            ):
+                self.assertTrue(self.controller.exportParticles([0], True))
+
+            self.assertEqual(original_target.read_bytes(), self.document.effect.original_data)
+            self.assertEqual(edited_target.read_bytes(), self.document.effect.to_bytes())
+            self.assertFalse(self.document.undo_stack.isClean())
 
     def test_loads_custom_v2_project_selection_inside_groups(self):
         with tempfile.TemporaryDirectory() as directory:

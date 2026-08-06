@@ -1,7 +1,13 @@
 import struct
 import unittest
 
-from pm_particle_modder.core import ParticleEffect, ParticleParseError
+from pm_particle_modder.core import (
+    ParticleEffect,
+    ParticleParseError,
+    compare_systems,
+    system_blocks,
+    word_differences,
+)
 
 
 def make_graph(x_start: float, y_start: float) -> bytes:
@@ -99,7 +105,7 @@ class ParticleEffectTests(unittest.TestCase):
         struct.pack_into("<II", header, 20, 1, 1)
         struct.pack_into("<I", header, 80, 0xE783D2BD)
         struct.pack_into("<3f", header, 84, 1.0, 2.0, 3.0)
-        struct.pack_into("<II", system, 4, 3, 0x10)
+        struct.pack_into("<II", system, 4, 3, 0x14)
         struct.pack_into("<2I", system, 12, 0x10, 0x04)
         struct.pack_into("<3f", system, 168, 4.0, 5.0, 6.0)
         effect = ParticleEffect.from_bytes(bytes(header + system))
@@ -109,11 +115,39 @@ class ParticleEffectTests(unittest.TestCase):
         parsed_system = effect.particle_systems[0]
         self.assertEqual(parsed_system.max_num_particles, 100)
         self.assertEqual(parsed_system.component_count, 3)
-        self.assertEqual(parsed_system.component_bit_flags, (0x10, 0x04, 0))
+        self.assertEqual(parsed_system.particle_stride, 0x14)
+        self.assertEqual(parsed_system.slot_widths, (0x10, 0x04, 0))
+        self.assertEqual([(slot.offset, slot.width) for slot in parsed_system.slots], [(0, 0x10), (0x10, 0x04), (0x14, 0)])
         self.assertEqual(parsed_system.position, (4.0, 5.0, 6.0))
-        self.assertEqual(parsed_system.component_data.offset, parsed_system.offset + 260)
+        self.assertEqual(parsed_system.behavior_data.offset, parsed_system.offset + 260)
         self.assertEqual(parsed_system.emitter_data.size, 0)
+        self.assertEqual(parsed_system.visualizer_data.size, 260)
         self.assertEqual(effect.to_bytes(), bytes(header + system))
+
+    def test_rejects_v73_stride_that_does_not_match_slot_widths(self):
+        source = bytearray(make_particle())
+        struct.pack_into("<I", source, 80 + 8, 4)
+        with self.assertRaisesRegex(ParticleParseError, "stride"):
+            ParticleEffect.from_bytes(bytes(source))
+
+    def test_compares_known_blocks_by_aligned_words(self):
+        left_effect = ParticleEffect.from_bytes(make_particle())
+        right_data = bytearray(make_particle())
+        right_system = ParticleEffect.from_bytes(bytes(right_data)).particle_systems[0]
+        struct.pack_into("<f", right_data, right_system.visualizer_data.offset + 4, 0.75)
+        right_effect = ParticleEffect.from_bytes(bytes(right_data))
+
+        compatibility = compare_systems(left_effect.particle_systems[0], right_effect.particle_systems[0])
+        differences = word_differences(
+            left_effect.to_bytes(), right_effect.to_bytes(),
+            left_effect.particle_systems[0], right_effect.particle_systems[0], "visualizer",
+        )
+
+        self.assertEqual(compatibility.level, "Exact")
+        self.assertEqual(set(system_blocks(left_effect.particle_systems[0])), {"header", "visualizer"})
+        self.assertEqual(len(differences), 1)
+        self.assertEqual(differences[0].relative_offset, 4)
+        self.assertAlmostEqual(differences[0].right_f32, 0.75)
 
     def test_rejects_unsupported_version(self):
         with self.assertRaisesRegex(ParticleParseError, "Unsupported particle version"):
