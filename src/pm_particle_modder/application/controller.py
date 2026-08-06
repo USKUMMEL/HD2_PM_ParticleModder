@@ -95,6 +95,15 @@ class PatchTarget:
     needs_write: bool = False
 
 
+@dataclass(eq=False)
+class ParticleSwap:
+    """Patch-only redirect from a source document to a game particle entry ID."""
+
+    source: Document
+    target_id: int
+    include_assets: bool = True
+
+
 class ValueEditCommand(QUndoCommand):
     def __init__(self, label: str, apply_value, old_value, new_value):
         super().__init__(label)
@@ -226,6 +235,7 @@ class ParticleController(QObject):
         self._archive: ArchiveReader | None = None
         self._project_path: Path | None = None
         self._patch_targets: list[PatchTarget] = []
+        self._particle_swaps: list[ParticleSwap] = []
         self._selected_patch_index = -1
         self._next_patch_number = 0
         self._game_data_directory: Path | None = None
@@ -638,7 +648,22 @@ class ParticleController(QObject):
             if key in included_resource_keys.get(id(archive), set())
             and self._should_write_staged_entry(archive, entry)
         )
-        return included + staged
+        return included + staged + len(self._particle_swaps)
+
+    @Property(int, notify=stateChanged)
+    def particleSwapCount(self) -> int:
+        return len(self._particle_swaps)
+
+    @Property("QVariantList", notify=stateChanged)
+    def particleSwapOptions(self):
+        return [
+            {
+                "source": swap.source.title or swap.source.path.name,
+                "target": str(swap.target_id),
+                "includeAssets": swap.include_assets,
+            }
+            for swap in self._particle_swaps
+        ]
 
     @Property(bool, notify=stateChanged)
     def canWritePatch(self) -> bool:
@@ -1804,6 +1829,11 @@ class ParticleController(QObject):
             elif document.patch_entry_id is not None:
                 entries[(document.patch_entry_id, PARTICLE_TYPE_ID)] = self._standalone_particle_entry(document)
 
+        for swap in self._particle_swaps:
+            entries[(swap.target_id, PARTICLE_TYPE_ID)] = self._swap_particle_entry(swap, archive)
+            if swap.include_assets:
+                entries.update(self._swap_asset_entries(swap))
+
         for source_archive in self._archives_for_patch():
             for key, entry in source_archive.staged_entries.items():
                 if (
@@ -1899,6 +1929,94 @@ class ParticleController(QObject):
                     keys.update((texture_id, TEXTURE_TYPE_ID) for texture_id in material.texture_ids)
         return resources
 
+    @Slot(int, str, bool, result=bool)
+    def createParticleSwap(self, source_index: int, target_id_text: str, include_assets: bool) -> bool:
+        if not 0 <= source_index < len(self.documents_model.documents):
+            return False
+        target_id = self._valid_patch_entry_id(target_id_text)
+        if target_id is None:
+            self._show_error("Invalid particle ID", "Enter a 64-bit decimal or 0x hexadecimal target particle ID.")
+            return False
+        source = self.documents_model.documents[source_index]
+        if source.archive_entry_id == target_id:
+            self._show_error("Particle swap", "The target ID is already the source particle. Use the shield icon to patch it directly.")
+            return False
+        self._particle_swaps = [swap for swap in self._particle_swaps if swap.target_id != target_id]
+        self._particle_swaps.append(ParticleSwap(source, target_id, include_assets))
+        self._mark_selected_patch_for_write()
+        self._set_status(f"Created particle swap {target_id} <- {source.title or source.path.name}")
+        self.stateChanged.emit()
+        return True
+
+    @Slot(int)
+    def removeParticleSwap(self, index: int) -> None:
+        if not 0 <= index < len(self._particle_swaps):
+            return
+        swap = self._particle_swaps.pop(index)
+        self._mark_selected_patch_for_write()
+        self._set_status(f"Removed particle swap for {swap.target_id}")
+        self.stateChanged.emit()
+
+    @Slot(int, result=str)
+    def particleTitleAt(self, index: int) -> str:
+        if not 0 <= index < len(self.documents_model.documents):
+            return ""
+        document = self.documents_model.documents[index]
+        return document.title or document.path.name
+
+    def _swap_particle_entry(self, swap: ParticleSwap, patch_archive: ArchiveReader) -> ArchiveEntry:
+        data = swap.source.effect.to_bytes()
+        source_entry = None
+        source_archive = self._resource_archive_for_document(swap.source)
+        if source_archive is not None and swap.source.archive_entry_id is not None:
+            source_entry = source_archive.get_entry(swap.source.archive_entry_id, PARTICLE_TYPE_ID)
+        template = patch_archive.get_entry(swap.target_id, PARTICLE_TYPE_ID)
+        if template is None:
+            template = source_entry
+        if template is not None:
+            payload_entry = source_entry or template
+            return replace(template, file_id=swap.target_id).with_data(
+                data, payload_entry.gpu_data, payload_entry.stream_data
+            )
+        return self._particle_entry_from_data(swap.target_id, data)
+
+    def _swap_asset_entries(self, swap: ParticleSwap) -> dict[tuple[int, int], ArchiveEntry]:
+        """Copy source material and texture resources needed by a particle swap."""
+        archive = self._resource_archive_for_document(swap.source)
+        if archive is None:
+            return {}
+        entries: dict[tuple[int, int], ArchiveEntry] = {}
+        try:
+            material_ids = {
+                material_id for _system_index, material_id in archive.particle_material_ids(swap.source.effect)
+            }
+        except ArchiveError:
+            return entries
+        for material_id in material_ids:
+            material_key = (material_id, MATERIAL_TYPE_ID)
+            material_entry = self._resource_entry_for_swap(archive, material_key)
+            if material_entry is None:
+                continue
+            entries[material_key] = material_entry
+            try:
+                material = parse_material(material_entry.toc_data)
+            except ArchiveError:
+                continue
+            for texture_id in material.texture_ids:
+                texture_key = (texture_id, TEXTURE_TYPE_ID)
+                texture_entry = self._resource_entry_for_swap(archive, texture_key)
+                if texture_entry is not None:
+                    entries[texture_key] = texture_entry
+        return entries
+
+    def _resource_entry_for_swap(
+        self, archive: ArchiveReader, key: tuple[int, int]
+    ) -> ArchiveEntry | None:
+        staged = archive.staged_entries.get(key)
+        if staged is not None and self._should_write_staged_entry(archive, staged):
+            return staged
+        return archive.get_entry(*key)
+
     def _should_write_staged_entry(self, archive: ArchiveReader, entry: ArchiveEntry) -> bool:
         return (
             entry.type_id != TEXTURE_TYPE_ID
@@ -1907,8 +2025,12 @@ class ParticleController(QObject):
 
     @staticmethod
     def _standalone_particle_entry(document: Document) -> ArchiveEntry:
+        return ParticleController._particle_entry_from_data(document.patch_entry_id, document.effect.to_bytes())
+
+    @staticmethod
+    def _particle_entry_from_data(entry_id: int, data: bytes) -> ArchiveEntry:
         return ArchiveEntry(
-            file_id=document.patch_entry_id,
+            file_id=entry_id,
             type_id=PARTICLE_TYPE_ID,
             toc_offset=0,
             stream_offset=0,
@@ -1921,7 +2043,7 @@ class ParticleController(QObject):
             unknown3=16,
             unknown4=64,
             index=0,
-            toc_data=document.effect.to_bytes(),
+            toc_data=data,
             gpu_data=b"",
             stream_data=b"",
         )
@@ -2748,6 +2870,97 @@ class ParticleController(QObject):
             documents.append(self.documents_model.documents[index])
         return documents
 
+    @Slot("QVariantList", bool, result=bool)
+    def exportParticles(self, indexes, with_edited_data: bool) -> bool:
+        """Export selected resources without changing their save or patch state."""
+        documents = self._documents_for_indexes(indexes)
+        if not documents:
+            return False
+        variant = "edited" if with_edited_data else "original"
+        if len(documents) == 1:
+            document = documents[0]
+            suggested = document.path.with_name(self._particle_export_name(document, variant))
+            path, _ = QFileDialog.getSaveFileName(
+                None,
+                f"Export {variant} particle",
+                str(suggested),
+                "Particle Files (*.particles);;All Files (*.*)",
+            )
+            if not path:
+                return False
+            target = self._with_particle_suffix(Path(path))
+            try:
+                self._write_particle_export(target, self._particle_export_data(document, with_edited_data))
+            except (OSError, ValueError) as error:
+                self._show_error("Unable to export particle", f"{target.name}\n\n{error}")
+                return False
+            self._set_status(f"Exported {variant} particle {target.name}")
+            return True
+
+        directory = QFileDialog.getExistingDirectory(None, f"Export {variant} particles")
+        if not directory:
+            return False
+        output_directory = Path(directory)
+        reserved_names: set[str] = set()
+        try:
+            for document in documents:
+                target = self._next_particle_export_path(
+                    output_directory, self._particle_export_name(document, variant), reserved_names
+                )
+                self._write_particle_export(target, self._particle_export_data(document, with_edited_data))
+        except (OSError, ValueError) as error:
+            self._show_error("Unable to export particles", str(error))
+            return False
+        self._set_status(f"Exported {len(documents)} {variant} particle files")
+        return True
+
+    @staticmethod
+    def _particle_export_data(document: Document, with_edited_data: bool) -> bytes:
+        if with_edited_data:
+            return document.effect.to_bytes()
+        return document.source_data or document.effect.original_data
+
+    @staticmethod
+    def _with_particle_suffix(path: Path) -> Path:
+        return path if path.suffix.casefold() in {".particle", ".particles"} else path.with_suffix(".particles")
+
+    @staticmethod
+    def _particle_export_name(document: Document, variant: str) -> str:
+        stem = str(document.archive_entry_id) if document.archive_entry_id is not None else document.path.stem
+        normalized_stem = re.sub(r'[<>:"/\\|?*]+', "_", stem).strip(" .") or "particle"
+        return f"{normalized_stem}_{variant}.particles"
+
+    @classmethod
+    def _next_particle_export_path(
+        cls, directory: Path, file_name: str, reserved_names: set[str]
+    ) -> Path:
+        directory.mkdir(parents=True, exist_ok=True)
+        candidate = directory / file_name
+        suffix = 1
+        while candidate.name.casefold() in reserved_names or candidate.exists():
+            candidate = directory / f"{Path(file_name).stem}_{suffix}.particles"
+            suffix += 1
+        reserved_names.add(candidate.name.casefold())
+        return candidate
+
+    @staticmethod
+    def _write_particle_export(target: Path, data: bytes) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", delete=False, dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
+            ) as temporary:
+                temporary.write(data)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+                temporary_path = Path(temporary.name)
+            os.replace(temporary_path, target)
+        except OSError:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            raise
+
     def _set_documents_group(self, documents: list[Document], group: str) -> None:
         if not documents:
             return
@@ -2844,6 +3057,8 @@ class ParticleController(QObject):
         document = self.documents_model.documents[index]
         if not self._confirm_close(document):
             return False
+        removed_swap_count = len(self._particle_swaps)
+        self._particle_swaps = [swap for swap in self._particle_swaps if swap.source is not document]
         previous_current = self._current_index
         self.documents_model.remove(index)
         if not self.documents_model.documents:
@@ -2856,6 +3071,9 @@ class ParticleController(QObject):
             next_index = previous_current
         self._current_index = -2
         self.setCurrentDocument(next_index)
+        if len(self._particle_swaps) != removed_swap_count:
+            self._mark_selected_patch_for_write()
+            self.stateChanged.emit()
         return True
 
     @Slot(result=bool)

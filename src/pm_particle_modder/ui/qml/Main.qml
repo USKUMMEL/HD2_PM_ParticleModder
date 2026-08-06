@@ -20,6 +20,7 @@ ApplicationWindow {
     property var selectedParticleIndexes: []
     property int particleSelectionAnchor: -1
     property var collapsedParticleGroups: []
+    property int particleSwapSourceIndex: -1
     property bool hexDragSelecting: false
     property bool hexCopyDragging: false
     property string hexSafeHoverNote: ""
@@ -101,6 +102,14 @@ ApplicationWindow {
         enabled: window.sectionIndex === 7 && controller.hasHexSelection
                  && !hexByteInput.activeFocus && !hexPasteInput.activeFocus
         onActivated: controller.copyHexSelection()
+    }
+
+    function openParticleSwapDialog(sourceIndex) {
+        particleSwapSourceIndex = sourceIndex
+        particleSwapTargetInput.text = ""
+        particleSwapAssets.checked = true
+        particleSwapDialog.open()
+        particleSwapTargetInput.forceActiveFocus()
     }
     Shortcut {
         sequence: StandardKey.Paste
@@ -285,6 +294,106 @@ ApplicationWindow {
                     onClicked: {
                         controller.renameSelectedPatchTo(patchNameInput.text)
                         patchRenameDialog.close()
+                    }
+                }
+            }
+        }
+    }
+
+    Dialog {
+        id: particleSwapDialog
+        title: "Create Particle Swap"
+        modal: true
+        anchors.centerIn: parent
+        width: 500
+        padding: 16
+        standardButtons: Dialog.NoButton
+        background: Rectangle { color: Theme.surface; border.color: Theme.border; radius: 5 }
+
+        contentItem: ColumnLayout {
+            spacing: 10
+            Text {
+                Layout.fillWidth: true
+                text: "SOURCE  " + controller.particleTitleAt(window.particleSwapSourceIndex)
+                color: Theme.textMuted
+                font.pixelSize: 11
+                elide: Text.ElideMiddle
+            }
+            Text { text: "Target particle ID"; color: Theme.textMuted; font.pixelSize: 11 }
+            PmTextField {
+                id: particleSwapTargetInput
+                Layout.fillWidth: true
+                placeholderText: "Decimal or 0x hexadecimal particle ID"
+                inputMethodHints: Qt.ImhNoPredictiveText
+                onAccepted: {
+                    if (controller.createParticleSwap(window.particleSwapSourceIndex, text, particleSwapAssets.checked))
+                        particleSwapDialog.close()
+                }
+            }
+            CheckBox {
+                id: particleSwapAssets
+                text: "Include source materials and textures"
+                checked: true
+                palette.text: Theme.text
+            }
+            Text {
+                Layout.fillWidth: true
+                text: "ACTIVE SWAPS"
+                color: Theme.textMuted
+                font.pixelSize: 10
+                font.weight: Font.DemiBold
+            }
+            ListView {
+                id: particleSwapList
+                Layout.fillWidth: true
+                Layout.preferredHeight: Math.min(126, Math.max(32, contentHeight))
+                clip: true
+                model: controller.particleSwapOptions
+                spacing: 3
+                delegate: Rectangle {
+                    required property int index
+                    required property var modelData
+                    width: particleSwapList.width
+                    height: 29
+                    color: Theme.surfaceRaised
+                    border.width: 1
+                    border.color: Theme.border
+                    radius: 3
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 7
+                        anchors.rightMargin: 3
+                        spacing: 6
+                        Text {
+                            Layout.fillWidth: true
+                            text: modelData.target + " <- " + modelData.source
+                                  + (modelData.includeAssets ? "  + assets" : "")
+                            color: Theme.text
+                            font.pixelSize: 10
+                            elide: Text.ElideMiddle
+                        }
+                        PmButton { text: "Remove"; onClicked: controller.removeParticleSwap(index) }
+                    }
+                }
+                Text {
+                    anchors.centerIn: parent
+                    visible: particleSwapList.count === 0
+                    text: "No active particle swaps"
+                    color: Theme.textMuted
+                    font.pixelSize: 11
+                }
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                PmButton { text: "Cancel"; onClicked: particleSwapDialog.close() }
+                PmButton {
+                    text: "Create Swap"
+                    accent: true
+                    enabled: particleSwapTargetInput.text.trim().length > 0
+                    onClicked: {
+                        if (controller.createParticleSwap(window.particleSwapSourceIndex, particleSwapTargetInput.text, particleSwapAssets.checked))
+                            particleSwapDialog.close()
                     }
                 }
             }
@@ -733,6 +842,23 @@ ApplicationWindow {
                         onTriggered: {
                             controller.removeDocumentsFromGroup(fileContextMenu.targetIndexes)
                             window.clearParticleSelection()
+                        }
+                    }
+                    MenuItem {
+                        text: "Swap into particle..."
+                        enabled: fileContextMenu.targetIndexes.length === 1
+                        onTriggered: window.openParticleSwapDialog(fileContextMenu.targetIndexes[0])
+                    }
+                    Menu {
+                        title: "Export .particles"
+                        enabled: fileContextMenu.targetIndexes.length > 0
+                        MenuItem {
+                            text: "Original data..."
+                            onTriggered: controller.exportParticles(fileContextMenu.targetIndexes, false)
+                        }
+                        MenuItem {
+                            text: "With edited data..."
+                            onTriggered: controller.exportParticles(fileContextMenu.targetIndexes, true)
                         }
                     }
                     MenuSeparator { }

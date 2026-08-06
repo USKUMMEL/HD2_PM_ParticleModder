@@ -553,6 +553,49 @@ class ControllerTests(unittest.TestCase):
             particle_ids = [entry.file_id for entry in patch.entries_of_type(PARTICLE_TYPE_ID)]
             self.assertEqual(particle_ids, [first_id])
 
+    def test_particle_swap_writes_source_data_at_target_id_with_assets(self):
+        source_id, target_id = 101, 202
+        material_id, texture_id = 301, 401
+        source = make_particle()
+
+        def material_data(texture: int) -> bytes:
+            data = bytearray(148)
+            struct.pack_into("<I", data, 64, 1)
+            struct.pack_into("<Q", data, 140, texture)
+            return bytes(data)
+
+        with tempfile.TemporaryDirectory() as directory:
+            archive_path = Path(directory) / "source_archive"
+            write_patch_archive(archive_path, [
+                particle_archive_entry(source_id, source),
+                particle_archive_entry(target_id, source),
+                archive_entry(material_id, MATERIAL_TYPE_ID, material_data(texture_id)),
+                archive_entry(texture_id, TEXTURE_TYPE_ID, b"texture"),
+            ])
+            archive = ArchiveReader.open(archive_path)
+            effect = ParticleEffect.from_bytes(archive.get_entry(source_id, PARTICLE_TYPE_ID).toc_data)
+            effect.min_lifetime = 2.0
+            effect.particle_systems[0].visualizer.material_id = material_id
+            controller = ParticleController()
+            controller.documents_model.append(Document(
+                Path(f"{source_id}.particles"), effect, QUndoStack(), archive=archive,
+                archive_entry_id=source_id, source_data=source,
+            ))
+            controller.setCurrentDocument(0)
+
+            self.assertTrue(controller.createParticleSwap(0, str(target_id), True))
+            self.assertEqual(controller.particleSwapCount, 1)
+            controller.createPatch()
+            controller.writePatch()
+
+            patch = ArchiveReader.open(Path(directory) / "9ba626afa44a3aa3.patch_0")
+            target = patch.get_entry(target_id, PARTICLE_TYPE_ID)
+            self.assertIsNotNone(target)
+            self.assertEqual(target.toc_data, effect.to_bytes())
+            self.assertIsNone(patch.get_entry(source_id, PARTICLE_TYPE_ID))
+            self.assertIsNotNone(patch.get_entry(material_id, MATERIAL_TYPE_ID))
+            self.assertIsNotNone(patch.get_entry(texture_id, TEXTURE_TYPE_ID))
+
     def test_patch_only_writes_assets_reachable_from_shield_enabled_particles(self):
         first_id, second_id = 101, 202
         first_material, second_material = 301, 302
@@ -797,6 +840,27 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(target.read_bytes(), self.document.effect.to_bytes())
             self.assertTrue(self.document.undo_stack.isClean())
             self.assertEqual(self.document.path, target.resolve())
+
+    def test_exports_original_or_edited_particle_without_changing_document_state(self):
+        self.controller.setLifetime("min", "2")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original_target = root / "original.particles"
+            edited_target = root / "edited.particles"
+            with patch(
+                "pm_particle_modder.application.controller.QFileDialog.getSaveFileName",
+                return_value=(str(original_target), "Particle Files (*.particles)"),
+            ):
+                self.assertTrue(self.controller.exportParticles([0], False))
+            with patch(
+                "pm_particle_modder.application.controller.QFileDialog.getSaveFileName",
+                return_value=(str(edited_target), "Particle Files (*.particles)"),
+            ):
+                self.assertTrue(self.controller.exportParticles([0], True))
+
+            self.assertEqual(original_target.read_bytes(), self.document.effect.original_data)
+            self.assertEqual(edited_target.read_bytes(), self.document.effect.to_bytes())
+            self.assertFalse(self.document.undo_stack.isClean())
 
     def test_loads_custom_v2_project_selection_inside_groups(self):
         with tempfile.TemporaryDirectory() as directory:
