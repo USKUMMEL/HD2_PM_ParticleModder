@@ -143,6 +143,26 @@ class ControllerTests(unittest.TestCase):
         self.controller.toggleHexHighlights()
         self.assertFalse(self.controller.hexHighlightsVisible)
 
+    def test_hex_viewer_compares_another_open_particle(self):
+        comparison = Document(
+            Path("comparison.particles"), ParticleEffect.from_bytes(make_particle()), QUndoStack()
+        )
+        self.controller.documents_model.append(comparison)
+
+        self.assertEqual(self.controller.hexCompareParticleOptions, ["No comparison", "comparison.particles [2]"])
+        self.controller.selectHexCompareParticle(1)
+        self.assertTrue(self.controller.hasHexComparison)
+        self.assertEqual(self.controller.hexCompareTitle, "comparison.particles")
+        self.assertGreater(self.controller.hex_compare_viewer_model.rowCount(), 0)
+
+        self.controller.selectHexCompareScope(1)
+        system_size = comparison.effect.particle_systems[0].size
+        self.assertEqual(self.controller.hex_compare_viewer_model.rowCount(), (system_size + 15) // 16)
+
+        self.controller.setCurrentDocument(1)
+        self.assertTrue(self.controller.hasHexComparison)
+        self.assertEqual(self.controller.hexCompareTitle, "fixture.particles")
+
     def test_fill_selection_is_one_undo_step(self):
         graph = self.controller.opacity_model.graph_at(0)
         original = [graph.y[0], graph.y[1], graph.y[2]]

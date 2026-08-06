@@ -48,6 +48,7 @@ def main() -> int:
     context.setContextProperty("textureBindingsModel", controller.texture_bindings_model)
     context.setContextProperty("textureOverviewModel", controller.texture_overview_model)
     context.setContextProperty("hexViewerModel", controller.hex_viewer_model)
+    context.setContextProperty("hexCompareViewerModel", controller.hex_compare_viewer_model)
 
     qml_path = package_dir / "ui" / "qml" / "Main.qml"
     engine.load(QUrl.fromLocalFile(str(qml_path)))

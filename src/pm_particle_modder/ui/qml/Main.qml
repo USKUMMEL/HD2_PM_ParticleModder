@@ -1510,6 +1510,28 @@ ApplicationWindow {
                                     currentIndex: controller.selectedHexScope
                                     onActivated: controller.selectHexScope(currentIndex)
                                 }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 7
+                                    Text { text: "COMPARE"; color: Theme.textMuted; font.pixelSize: 10; font.weight: Font.DemiBold }
+                                    ComboBox {
+                                        id: hexCompareParticleSelector
+                                        Layout.fillWidth: true
+                                        Layout.preferredHeight: 32
+                                        model: controller.hexCompareParticleOptions
+                                        currentIndex: controller.selectedHexCompareParticle
+                                        onActivated: controller.selectHexCompareParticle(currentIndex)
+                                    }
+                                    ComboBox {
+                                        id: hexCompareScopeSelector
+                                        visible: controller.hasHexComparison
+                                        Layout.preferredWidth: 200
+                                        Layout.preferredHeight: 32
+                                        model: controller.hexCompareScopeOptions
+                                        currentIndex: controller.selectedHexCompareScope
+                                        onActivated: controller.selectHexCompareScope(currentIndex)
+                                    }
+                                }
                                 ColumnLayout {
                                     Layout.fillWidth: true
                                     enabled: controller.hasSelectedHexByte
@@ -1722,6 +1744,73 @@ ApplicationWindow {
                                                     ToolTip.text: window.hexSafeHoverNote
                                                     ToolTip.delay: 550
                                                 }
+                                            }
+                                        }
+                                    }
+                                    Rectangle {
+                                        id: hexCompareDataPanel
+                                        visible: controller.hasHexComparison
+                                        Layout.fillWidth: true
+                                        Layout.fillHeight: true
+                                        property int byteWidth: Math.max(12, Math.min(29, Math.floor((width - 76) / 16) - 1))
+                                        property bool showAscii: width >= 680
+                                        color: "#11151B"
+                                        border.width: 1
+                                        border.color: Theme.border
+                                        radius: 4
+                                        ColumnLayout {
+                                            anchors.fill: parent
+                                            anchors.margins: 8
+                                            spacing: 4
+                                            Text {
+                                                Layout.fillWidth: true
+                                                text: "COMPARE: " + controller.hexCompareTitle
+                                                color: Theme.textMuted
+                                                font.pixelSize: 10
+                                                font.weight: Font.DemiBold
+                                                elide: Text.ElideMiddle
+                                            }
+                                            Row {
+                                                Layout.fillWidth: true
+                                                spacing: 1
+                                                Text { width: 74; text: "OFFSET"; color: Theme.textMuted; font.pixelSize: 10; font.family: "Consolas" }
+                                                Repeater {
+                                                    model: 16
+                                                    delegate: Text { required property int index; width: hexCompareDataPanel.byteWidth; text: index.toString(16).toUpperCase().padStart(2, "0"); color: Theme.textMuted; font.pixelSize: 10; font.family: "Consolas"; horizontalAlignment: Text.AlignHCenter }
+                                                }
+                                                Text { visible: hexCompareDataPanel.showAscii; width: 116; text: "ASCII"; color: Theme.textMuted; font.pixelSize: 10; font.family: "Consolas"; horizontalAlignment: Text.AlignHCenter }
+                                            }
+                                            Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.border }
+                                            ListView {
+                                                id: hexCompareRows
+                                                Layout.fillWidth: true
+                                                Layout.fillHeight: true
+                                                model: hexCompareViewerModel
+                                                clip: true
+                                                boundsBehavior: Flickable.StopAtBounds
+                                                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                                                delegate: Row {
+                                                    required property string hexOffset
+                                                    required property var hexCells
+                                                    required property string asciiText
+                                                    width: hexCompareRows.width - 8
+                                                    height: 23
+                                                    spacing: 1
+                                                    Text { width: 74; height: 22; text: hexOffset; color: Theme.textMuted; font.pixelSize: 11; font.family: "Consolas"; verticalAlignment: Text.AlignVCenter }
+                                                    Repeater {
+                                                        model: hexCells
+                                                        delegate: Rectangle {
+                                                            required property var modelData
+                                                            width: hexCompareDataPanel.byteWidth; height: 22; radius: 2
+                                                            color: modelData.safe ? "#332E1A" : "transparent"
+                                                            border.width: modelData.safe ? 1 : 0
+                                                            border.color: modelData.safe ? "#E3BF69" : modelData.color
+                                                            Text { anchors.centerIn: parent; text: modelData.text; color: modelData.color; font.pixelSize: 11; font.family: "Consolas" }
+                                                        }
+                                                    }
+                                                    Text { visible: hexCompareDataPanel.showAscii; width: 116; height: 22; text: asciiText; color: Theme.textMuted; font.pixelSize: 11; font.family: "Consolas"; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight }
+                                                }
+                                                Text { anchors.centerIn: parent; visible: hexCompareRows.count === 0; text: "Choose a particle to compare"; color: Theme.textMuted; font.pixelSize: 12 }
                                             }
                                         }
                                     }

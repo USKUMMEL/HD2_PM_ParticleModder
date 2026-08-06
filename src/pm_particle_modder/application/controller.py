@@ -217,6 +217,7 @@ class ParticleController(QObject):
         self.texture_bindings_model = TextureBindingListModel()
         self.texture_overview_model = TextureOverviewListModel()
         self.hex_viewer_model = HexViewerModel()
+        self.hex_compare_viewer_model = HexViewerModel()
         self._current_index = -1
         self._archive: ArchiveReader | None = None
         self._project_path: Path | None = None
@@ -254,6 +255,8 @@ class ParticleController(QObject):
         self._texture_overview_pool = QThreadPool(self)
         self._texture_overview_pool.setMaxThreadCount(1)
         self._selected_hex_scope = 0
+        self._hex_compare_document: Document | None = None
+        self._selected_hex_compare_scope = 0
         self._selected_hex_pattern = -1
         self._hex_patterns: list[dict] = []
         self._hex_safe_patterns: list[dict] = []
@@ -342,6 +345,45 @@ class ParticleController(QObject):
     @Property(int, notify=stateChanged)
     def selectedHexScope(self) -> int:
         return self._selected_hex_scope
+
+    @Property("QVariantList", notify=stateChanged)
+    def hexCompareParticleOptions(self):
+        return ["No comparison", *(
+            f"{document.title or document.path.name} [{index + 1}]"
+            for index, document in self._hex_comparable_documents()
+        )]
+
+    @Property(int, notify=stateChanged)
+    def selectedHexCompareParticle(self) -> int:
+        if self._hex_compare_document is None:
+            return 0
+        for index, (_document_index, document) in enumerate(self._hex_comparable_documents(), start=1):
+            if document is self._hex_compare_document:
+                return index
+        return 0
+
+    @Property(bool, notify=stateChanged)
+    def hasHexComparison(self) -> bool:
+        return self._hex_compare_document in self._hex_comparable_document_values()
+
+    @Property(str, notify=stateChanged)
+    def hexCompareTitle(self) -> str:
+        document = self._hex_compare_document if self.hasHexComparison else None
+        return document.title or document.path.name if document is not None else ""
+
+    @Property("QVariantList", notify=stateChanged)
+    def hexCompareScopeOptions(self):
+        document = self._hex_compare_document if self.hasHexComparison else None
+        if document is None:
+            return ["Entire .particle"]
+        return ["Entire .particle", *(
+            f"Particle System {system.index + 1}"
+            for system in document.effect.particle_systems
+        )]
+
+    @Property(int, notify=stateChanged)
+    def selectedHexCompareScope(self) -> int:
+        return self._selected_hex_compare_scope
 
     @Property("QVariantList", notify=stateChanged)
     def hexPatternOptions(self):
@@ -1804,6 +1846,22 @@ class ParticleController(QObject):
         self.stateChanged.emit()
 
     @Slot(int)
+    def selectHexCompareParticle(self, option_index: int) -> None:
+        options = self._hex_comparable_documents()
+        self._hex_compare_document = options[option_index - 1][1] if 1 <= option_index <= len(options) else None
+        self._selected_hex_compare_scope = 0
+        self._refresh_hex_comparison()
+        self.stateChanged.emit()
+
+    @Slot(int)
+    def selectHexCompareScope(self, option_index: int) -> None:
+        if not self.hasHexComparison or not 0 <= option_index < len(self.hexCompareScopeOptions):
+            return
+        self._selected_hex_compare_scope = option_index
+        self._refresh_hex_comparison()
+        self.stateChanged.emit()
+
+    @Slot(int)
     def selectHexPattern(self, pattern_index: int) -> None:
         self._selected_hex_pattern = pattern_index if 0 <= pattern_index < len(self._hex_patterns) else -1
         self.hex_viewer_model.set_selected_pattern(self._selected_hex_pattern)
@@ -1921,6 +1979,7 @@ class ParticleController(QObject):
     def toggleHexHighlights(self) -> None:
         self._hex_highlights_visible = not self._hex_highlights_visible
         self.hex_viewer_model.set_safe_regions_visible(self._hex_highlights_visible)
+        self.hex_compare_viewer_model.set_safe_regions_visible(self._hex_highlights_visible)
         self.stateChanged.emit()
 
     @Slot()
@@ -1974,6 +2033,7 @@ class ParticleController(QObject):
             self._hex_selection_anchor = -1
             self._hex_selection_end = -1
             self.hex_viewer_model.set_content(b"", 0, [], [])
+            self._refresh_hex_comparison()
             return
         try:
             data = document.effect.to_bytes()
@@ -2011,6 +2071,45 @@ class ParticleController(QObject):
         self.hex_viewer_model.set_selected_offset(self._selected_hex_offset)
         self.hex_viewer_model.set_selection_range(self._hex_selection_anchor, self._hex_selection_end)
         self.hex_viewer_model.set_safe_regions_visible(self._hex_highlights_visible)
+        self._refresh_hex_comparison()
+
+    def _refresh_hex_comparison(self) -> None:
+        document = self._hex_compare_document if self.hasHexComparison else None
+        if document is None:
+            self._hex_compare_document = None
+            self._selected_hex_compare_scope = 0
+            self.hex_compare_viewer_model.set_content(b"", 0, [], [])
+            return
+        try:
+            data = document.effect.to_bytes()
+        except ValueError:
+            data = document.effect.original_data
+        systems = document.effect.particle_systems
+        if not 0 <= self._selected_hex_compare_scope <= len(systems):
+            self._selected_hex_compare_scope = 0
+        if self._selected_hex_compare_scope == 0:
+            base_offset = 0
+            view_data = data
+            patterns = self._particle_hex_patterns(document.effect, len(data))
+            safe_patterns = self._particle_hex_safe_patterns(document.effect, len(data))
+        else:
+            system = systems[self._selected_hex_compare_scope - 1]
+            base_offset = system.offset
+            view_data = data[system.offset:system.offset + system.size]
+            patterns = self._system_hex_patterns(system, len(data), include_system=True)
+            safe_patterns = self._system_hex_safe_patterns(system, len(data))
+        self.hex_compare_viewer_model.set_content(view_data, base_offset, patterns, safe_patterns)
+        self.hex_compare_viewer_model.set_safe_regions_visible(self._hex_highlights_visible)
+
+    def _hex_comparable_documents(self) -> list[tuple[int, Document]]:
+        return [
+            (index, document)
+            for index, document in enumerate(self.documents_model.documents)
+            if document is not self.current_document
+        ]
+
+    def _hex_comparable_document_values(self) -> list[Document]:
+        return [document for _index, document in self._hex_comparable_documents()]
 
     def _selected_hex_byte(self) -> int | None:
         return self._selected_hex_byte_at(self._selected_hex_offset)
@@ -2439,7 +2538,12 @@ class ParticleController(QObject):
     def setCurrentDocument(self, index: int) -> None:
         if index == self._current_index:
             return
-        self._current_index = index if 0 <= index < len(self.documents_model.documents) else -1
+        previous_document = self.current_document
+        next_document = self.documents_model.documents[index] if 0 <= index < len(self.documents_model.documents) else None
+        if next_document is self._hex_compare_document and previous_document is not None:
+            self._hex_compare_document = previous_document
+            self._selected_hex_compare_scope = 0
+        self._current_index = index if next_document is not None else -1
         effect = self.current_document.effect if self.current_document else None
         self.color_model.set_effect(effect)
         self.opacity_model.set_effect(effect)
