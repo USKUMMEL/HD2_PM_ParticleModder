@@ -1532,6 +1532,80 @@ ApplicationWindow {
                                         onActivated: controller.selectHexCompareScope(currentIndex)
                                     }
                                 }
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: controller.hexScopeLayout
+                                    color: Theme.textMuted
+                                    font.pixelSize: 10
+                                    font.family: "Consolas"
+                                    wrapMode: Text.Wrap
+                                    maximumLineCount: 2
+                                    elide: Text.ElideRight
+                                }
+                                Rectangle {
+                                    visible: controller.hasHexSystemDiff
+                                    Layout.fillWidth: true
+                                    Layout.preferredHeight: visible ? 148 : 0
+                                    color: "#11151B"
+                                    border.width: 1
+                                    border.color: Theme.border
+                                    radius: 4
+                                    ColumnLayout {
+                                        anchors.fill: parent
+                                        anchors.margins: 7
+                                        spacing: 4
+                                        RowLayout {
+                                            Layout.fillWidth: true
+                                            Text { text: "WORD DIFF"; color: Theme.textMuted; font.pixelSize: 10; font.weight: Font.DemiBold }
+                                            ComboBox {
+                                                Layout.preferredWidth: 185
+                                                Layout.preferredHeight: 28
+                                                model: controller.hexDiffBlockOptions
+                                                currentIndex: controller.selectedHexDiffBlock
+                                                onActivated: controller.selectHexDiffBlock(currentIndex)
+                                            }
+                                            Text { text: controller.hexDiffSummary; color: Theme.textMuted; font.pixelSize: 10; Layout.fillWidth: true; elide: Text.ElideRight }
+                                        }
+                                        Text {
+                                            Layout.fillWidth: true
+                                            text: controller.hexCompatibilitySummary
+                                            color: Theme.textMuted
+                                            font.pixelSize: 9
+                                            elide: Text.ElideRight
+                                        }
+                                        ListView {
+                                            id: hexWordDiffList
+                                            Layout.fillWidth: true
+                                            Layout.fillHeight: true
+                                            clip: true
+                                            spacing: 2
+                                            model: controller.hexWordDifferences
+                                            boundsBehavior: Flickable.StopAtBounds
+                                            ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                                            delegate: Rectangle {
+                                                required property var modelData
+                                                width: hexWordDiffList.width - 6
+                                                height: 28
+                                                color: "#181E27"
+                                                border.width: 1
+                                                border.color: Theme.border
+                                                radius: 3
+                                                RowLayout {
+                                                    anchors.fill: parent
+                                                    anchors.leftMargin: 6
+                                                    anchors.rightMargin: 4
+                                                    spacing: 7
+                                                    Text { text: modelData.relativeOffset; color: Theme.accent; font.pixelSize: 10; font.family: "Consolas"; Layout.preferredWidth: 52 }
+                                                    Text { text: "A " + modelData.leftHex + "  " + modelData.leftF32; color: Theme.text; font.pixelSize: 10; font.family: "Consolas"; Layout.preferredWidth: 185; elide: Text.ElideRight }
+                                                    Text { text: "B " + modelData.rightHex + "  " + modelData.rightF32; color: Theme.text; font.pixelSize: 10; font.family: "Consolas"; Layout.preferredWidth: 185; elide: Text.ElideRight }
+                                                    Text { text: modelData.slot || modelData.kind; color: Theme.textMuted; font.pixelSize: 9; Layout.fillWidth: true; elide: Text.ElideRight }
+                                                    PmButton { text: "B -> A"; tooltip: "Copy this exact 4-byte word from compare particle B into current particle A"; onClicked: controller.transplantHexWordDifference(index) }
+                                                }
+                                            }
+                                            Text { anchors.centerIn: parent; visible: hexWordDiffList.count === 0; text: "No aligned word differences"; color: Theme.textMuted; font.pixelSize: 11 }
+                                        }
+                                    }
+                                }
                                 ColumnLayout {
                                     Layout.fillWidth: true
                                     enabled: controller.hasSelectedHexByte
@@ -1565,6 +1639,16 @@ ApplicationWindow {
                                             onAccepted: { if (controller.pasteHexBytes(text)) clear() }
                                         }
                                         PmButton { text: "Paste"; onClicked: { if (controller.pasteHexBytes(hexPasteInput.text)) hexPasteInput.clear() } }
+                                    }
+                                    Text {
+                                        Layout.fillWidth: true
+                                        text: controller.hexInspectorSummary
+                                        color: Theme.textMuted
+                                        font.pixelSize: 10
+                                        font.family: "Consolas"
+                                        wrapMode: Text.Wrap
+                                        maximumLineCount: 2
+                                        elide: Text.ElideRight
                                     }
                                 }
                                 RowLayout {

@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import re
+import struct
 import tempfile
 from urllib.request import urlopen
 import xml.etree.ElementTree as ET
@@ -36,11 +37,14 @@ from pm_particle_modder.core import (
     Graph,
     ParticleEffect,
     ParticleParseError,
+    compare_systems,
     parse_texture,
     parse_material,
     preview_dds,
     replace_material_variable,
     SlimArchiveStore,
+    system_blocks,
+    word_differences,
     write_patch_archive,
 )
 from pm_particle_modder.ui.models import (
@@ -265,6 +269,10 @@ class ParticleController(QObject):
         self._hex_selection_anchor = -1
         self._hex_selection_end = -1
         self._hex_highlights_visible = False
+        self._hex_diff_block = "behavior"
+        self._hex_diff_blocks: list[str] = []
+        self._hex_compatibility = None
+        self._hex_word_differences = ()
         self._status = "Ready"
         self._load_preferences()
 
@@ -385,6 +393,69 @@ class ParticleController(QObject):
     def selectedHexCompareScope(self) -> int:
         return self._selected_hex_compare_scope
 
+    @Property(str, notify=stateChanged)
+    def hexScopeLayout(self) -> str:
+        system = self._hex_scope_system(self.current_document, self._selected_hex_scope)
+        if system is None:
+            return "Choose a Particle System scope to inspect its runtime slot layout."
+        slots = ", ".join(
+            f"S{slot.index} +0x{slot.offset:X} ({slot.width})" for slot in system.slots
+        ) or "no slots"
+        return f"Stride 0x{system.particle_stride:X} | {slots}"
+
+    @Property("QVariantList", notify=stateChanged)
+    def hexDiffBlockOptions(self):
+        labels = {
+            "header": "System Header",
+            "behavior": "Behavior / BigChunk",
+            "emitter": "Emitter",
+            "visualizer": "Visualizer",
+        }
+        return [labels[name] for name in self._hex_diff_blocks]
+
+    @Property(int, notify=stateChanged)
+    def selectedHexDiffBlock(self) -> int:
+        try:
+            return self._hex_diff_blocks.index(self._hex_diff_block)
+        except ValueError:
+            return 0
+
+    @Property(bool, notify=stateChanged)
+    def hasHexSystemDiff(self) -> bool:
+        return bool(self._hex_diff_blocks)
+
+    @Property(str, notify=stateChanged)
+    def hexCompatibilitySummary(self) -> str:
+        if self._hex_compatibility is None:
+            return "Choose a Particle System on both sides for block-relative word diff."
+        return f"Compatibility: {self._hex_compatibility.level} | " + " | ".join(self._hex_compatibility.reasons)
+
+    @Property(str, notify=stateChanged)
+    def hexDiffSummary(self) -> str:
+        if not self.hasHexSystemDiff:
+            return self.hexCompatibilitySummary
+        return f"{len(self._hex_word_differences)} different aligned words in selected block."
+
+    @Property("QVariantList", notify=stateChanged)
+    def hexWordDifferences(self):
+        return [
+            {
+                "relativeOffset": f"+0x{difference.relative_offset:X}",
+                "leftHex": difference.left_bytes.hex(" ").upper(),
+                "rightHex": difference.right_bytes.hex(" ").upper(),
+                "leftF32": self._format_hex_float(difference.left_f32),
+                "rightF32": self._format_hex_float(difference.right_f32),
+                "leftU32": f"0x{difference.left_u32:X}",
+                "rightU32": f"0x{difference.right_u32:X}",
+                "kind": "scalar candidate" if difference.likely_scalar else "raw word",
+                "slot": (
+                    f"Slot {difference.slot.index} boundary (+0x{difference.slot.offset:X}, {difference.slot.width} bytes)"
+                    if difference.slot is not None else ""
+                ),
+            }
+            for difference in self._hex_word_differences
+        ]
+
     @Property("QVariantList", notify=stateChanged)
     def hexPatternOptions(self):
         return [
@@ -427,6 +498,44 @@ class ParticleController(QObject):
         if value is None:
             return ""
         return chr(value) if 32 <= value <= 126 else "."
+
+    @Property(str, notify=stateChanged)
+    def hexInspectorSummary(self) -> str:
+        """Describe the selected word without assigning unsupported semantics."""
+        document = self.current_document
+        offset = self._selected_hex_offset
+        if document is None or offset < 0:
+            return "Select a byte to inspect its offsets and 32-bit interpretations."
+        try:
+            data = document.effect.to_bytes()
+        except ValueError:
+            return "Current particle data is not valid for inspection."
+        if offset >= len(data):
+            return ""
+        word_offset = offset & ~0x3
+        word = data[word_offset:word_offset + 4]
+        if len(word) < 4:
+            word = word + bytes(4 - len(word))
+        u32_value = int.from_bytes(word, "little")
+        i32_value = int.from_bytes(word, "little", signed=True)
+        f32_value = struct.unpack("<f", word)[0]
+        details = [f"Abs 0x{offset:X}"]
+        system = next(
+            (item for item in document.effect.particle_systems if item.offset <= offset < item.offset + item.size),
+            None,
+        )
+        if system is not None:
+            details.append(f"System {system.index + 1} +0x{offset - system.offset:X}")
+            for block_name, block in system_blocks(system).items():
+                if block.offset <= offset < block.end:
+                    details.append(f"{block_name.title()} +0x{offset - block.offset:X}")
+                    if block_name == "behavior":
+                        slot = next((slot for slot in system.slots if slot.offset == u32_value), None)
+                        if slot is not None:
+                            details.append(f"Slot {slot.index} boundary ({slot.width} bytes)")
+                    break
+        float_text = self._format_hex_float(f32_value)
+        return " | ".join(details) + f"\nWord {word.hex(' ').upper()} | u32 {u32_value} | i32 {i32_value} | f32 {float_text}"
 
     @Property(bool, notify=stateChanged)
     def hasHexSelection(self) -> bool:
@@ -1862,6 +1971,26 @@ class ParticleController(QObject):
         self.stateChanged.emit()
 
     @Slot(int)
+    def selectHexDiffBlock(self, option_index: int) -> None:
+        if not 0 <= option_index < len(self._hex_diff_blocks):
+            return
+        self._hex_diff_block = self._hex_diff_blocks[option_index]
+        self._refresh_hex_diff()
+        self.stateChanged.emit()
+
+    @Slot(int, result=bool)
+    def transplantHexWordDifference(self, difference_index: int) -> bool:
+        if not 0 <= difference_index < len(self._hex_word_differences):
+            return False
+        difference = self._hex_word_differences[difference_index]
+        return self._apply_hex_replacement(
+            difference.right_bytes,
+            f"Transplant {self._hex_diff_block} word {difference.relative_offset:#x}",
+            offset=difference.left_offset,
+            select_range=(difference.left_offset, difference.left_offset + 3),
+        )
+
+    @Slot(int)
     def selectHexPattern(self, pattern_index: int) -> None:
         self._selected_hex_pattern = pattern_index if 0 <= pattern_index < len(self._hex_patterns) else -1
         self.hex_viewer_model.set_selected_pattern(self._selected_hex_pattern)
@@ -2079,6 +2208,7 @@ class ParticleController(QObject):
             self._hex_compare_document = None
             self._selected_hex_compare_scope = 0
             self.hex_compare_viewer_model.set_content(b"", 0, [], [])
+            self._refresh_hex_diff()
             return
         try:
             data = document.effect.to_bytes()
@@ -2100,6 +2230,47 @@ class ParticleController(QObject):
             safe_patterns = self._system_hex_safe_patterns(system, len(data))
         self.hex_compare_viewer_model.set_content(view_data, base_offset, patterns, safe_patterns)
         self.hex_compare_viewer_model.set_safe_regions_visible(self._hex_highlights_visible)
+        self._refresh_hex_diff()
+
+    @staticmethod
+    def _hex_scope_system(document: Document | None, scope: int):
+        if document is None or not 1 <= scope <= len(document.effect.particle_systems):
+            return None
+        return document.effect.particle_systems[scope - 1]
+
+    @staticmethod
+    def _format_hex_float(value: float) -> str:
+        return f"{value:.7g}" if math.isfinite(value) else "non-finite"
+
+    def _refresh_hex_diff(self) -> None:
+        left_document = self.current_document
+        right_document = self._hex_compare_document if self.hasHexComparison else None
+        left_system = self._hex_scope_system(left_document, self._selected_hex_scope)
+        right_system = self._hex_scope_system(right_document, self._selected_hex_compare_scope)
+        self._hex_compatibility = None
+        self._hex_diff_blocks = []
+        self._hex_word_differences = ()
+        if left_system is None or right_system is None:
+            return
+        self._hex_compatibility = compare_systems(left_system, right_system)
+        left_blocks = system_blocks(left_system)
+        right_blocks = system_blocks(right_system)
+        self._hex_diff_blocks = [
+            name for name in ("header", "behavior", "emitter", "visualizer")
+            if name in left_blocks and name in right_blocks
+        ]
+        if not self._hex_diff_blocks:
+            return
+        if self._hex_diff_block not in self._hex_diff_blocks:
+            self._hex_diff_block = self._hex_diff_blocks[0]
+        try:
+            left_data = left_document.effect.to_bytes()
+            right_data = right_document.effect.to_bytes()
+        except ValueError:
+            return
+        self._hex_word_differences = word_differences(
+            left_data, right_data, left_system, right_system, self._hex_diff_block,
+        )
 
     def _hex_comparable_documents(self) -> list[tuple[int, Document]]:
         return [
@@ -2144,9 +2315,11 @@ class ParticleController(QObject):
     ) -> bool:
         document = self.current_document
         bounds = self._hex_selection_bounds()
-        if document is None or bounds is None:
+        if document is None:
             return False
         if offset is None:
+            if bounds is None:
+                return False
             offset = bounds[0]
         try:
             current = document.effect.to_bytes()
@@ -2215,11 +2388,11 @@ class ParticleController(QObject):
         prefix = f"System {system.index + 1}: "
         if include_system:
             self._add_hex_pattern(patterns, prefix + "entire system", system.offset, system.size, "system", data_size)
-        self._add_hex_pattern(patterns, prefix + "header", system.offset, 260, "system", data_size)
-        if system.component_data is not None:
+        self._add_hex_pattern(patterns, prefix + "header", system.offset, system.header_size, "system", data_size)
+        if system.behavior_data is not None:
             self._add_hex_pattern(
-                patterns, prefix + "component block", system.component_data.offset,
-                system.component_data.size, "component", data_size,
+                patterns, prefix + "behavior block", system.behavior_data.offset,
+                system.behavior_data.size, "component", data_size,
             )
         if system.emitter_data is not None:
             self._add_hex_pattern(

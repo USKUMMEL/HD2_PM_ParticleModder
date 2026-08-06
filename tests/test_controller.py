@@ -99,6 +99,8 @@ class ControllerTests(unittest.TestCase):
         self.controller.selectHexScope(0)
         self.controller.selectHexByte(6)
         self.assertEqual(self.controller.selectedHexValue, "80")
+        self.assertIn("Abs 0x6", self.controller.hexInspectorSummary)
+        self.assertIn("u32 1065353216", self.controller.hexInspectorSummary)
         self.assertTrue(self.controller.applySelectedHexByte("00"))
         self.assertEqual(struct.unpack_from("<f", self.document.effect.to_bytes(), 4)[0], 0.5)
         self.controller.undo()
@@ -162,6 +164,36 @@ class ControllerTests(unittest.TestCase):
         self.controller.setCurrentDocument(1)
         self.assertTrue(self.controller.hasHexComparison)
         self.assertEqual(self.controller.hexCompareTitle, "fixture.particles")
+
+    def test_hex_word_diff_transplants_exactly_one_word(self):
+        comparison_data = bytearray(make_particle())
+        visualizer_offset = self.document.effect.particle_systems[0].visualizer_data.offset
+        struct.pack_into("<f", comparison_data, visualizer_offset + 4, 0.75)
+        comparison = Document(
+            Path("comparison.particles"), ParticleEffect.from_bytes(bytes(comparison_data)), QUndoStack()
+        )
+        self.controller.documents_model.append(comparison)
+
+        self.controller.selectHexScope(1)
+        self.controller.selectHexCompareParticle(1)
+        self.controller.selectHexCompareScope(1)
+
+        self.assertTrue(self.controller.hasHexSystemDiff)
+        self.assertIn("Compatibility: Exact", self.controller.hexCompatibilitySummary)
+        self.controller.selectHexDiffBlock(
+            self.controller.hexDiffBlockOptions.index("Visualizer")
+        )
+        differences = self.controller.hexWordDifferences
+        self.assertEqual(len(differences), 1)
+        self.assertEqual(differences[0]["relativeOffset"], "+0x4")
+        before = self.document.effect.to_bytes()
+        self.assertTrue(self.controller.transplantHexWordDifference(0))
+        after = self.document.effect.to_bytes()
+        changed = [index for index, pair in enumerate(zip(before, after)) if pair[0] != pair[1]]
+        self.assertTrue(changed)
+        self.assertTrue(set(changed).issubset(range(visualizer_offset + 4, visualizer_offset + 8)))
+        self.controller.undo()
+        self.assertEqual(self.document.effect.to_bytes(), before)
 
     def test_fill_selection_is_one_undo_step(self):
         graph = self.controller.opacity_model.graph_at(0)
