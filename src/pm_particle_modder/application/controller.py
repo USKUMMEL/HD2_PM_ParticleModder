@@ -48,6 +48,7 @@ from pm_particle_modder.ui.models import (
     AssetLinkListModel,
     DocumentListModel,
     FoundArchiveListModel,
+    HexViewerModel,
     ParticleTableModel,
     MaterialVariableListModel,
     TextureBindingListModel,
@@ -190,6 +191,15 @@ class ParticleController(QObject):
     tableSelectionsChanged = Signal(str)
     ARCHIVE_LIST_URL = "https://raw.githubusercontent.com/Boxofbiscuits97/HD2SDK-CommunityEdition/main/hashlists/archivehashes.json"
     BASE_PATCH_ARCHIVE_ID = "9ba626afa44a3aa3"
+    HEX_PATTERN_COLORS = {
+        "particle": "#D7AD5B",
+        "system": "#6EB5FF",
+        "component": "#63C6A0",
+        "emitter": "#EC8879",
+        "visualizer": "#B89AE8",
+        "graph": "#E3BF69",
+        "marker": "#F06E9C",
+    }
 
     def __init__(self, parent=None, settings_path: str | Path | None = None):
         super().__init__(parent)
@@ -206,6 +216,7 @@ class ParticleController(QObject):
         self.asset_links_model = AssetLinkListModel()
         self.texture_bindings_model = TextureBindingListModel()
         self.texture_overview_model = TextureOverviewListModel()
+        self.hex_viewer_model = HexViewerModel()
         self._current_index = -1
         self._archive: ArchiveReader | None = None
         self._project_path: Path | None = None
@@ -242,6 +253,15 @@ class ParticleController(QObject):
         self._texture_overview_request = 0
         self._texture_overview_pool = QThreadPool(self)
         self._texture_overview_pool.setMaxThreadCount(1)
+        self._selected_hex_scope = 0
+        self._selected_hex_pattern = -1
+        self._hex_patterns: list[dict] = []
+        self._hex_safe_patterns: list[dict] = []
+        self._hex_base_offset = 0
+        self._selected_hex_offset = -1
+        self._hex_selection_anchor = -1
+        self._hex_selection_end = -1
+        self._hex_highlights_visible = False
         self._status = "Ready"
         self._load_preferences()
 
@@ -308,6 +328,83 @@ class ParticleController(QObject):
     @Property("QVariantList", notify=stateChanged)
     def materialOptions(self):
         return [str(material_id) for material_id in self._material_ids_by_system.get(self._selected_material_system, [])]
+
+    @Property("QVariantList", notify=stateChanged)
+    def hexScopeOptions(self):
+        document = self.current_document
+        if document is None:
+            return ["Entire .particle"]
+        return ["Entire .particle", *(
+            f"Particle System {system.index + 1}"
+            for system in document.effect.particle_systems
+        )]
+
+    @Property(int, notify=stateChanged)
+    def selectedHexScope(self) -> int:
+        return self._selected_hex_scope
+
+    @Property("QVariantList", notify=stateChanged)
+    def hexPatternOptions(self):
+        return [
+            {
+                "label": pattern["label"],
+                "offset": f"0x{pattern['offset']:X}",
+                "size": f"0x{pattern['size']:X}",
+                "color": pattern["color"],
+            }
+            for pattern in self._hex_patterns
+        ]
+
+    @Property(int, notify=stateChanged)
+    def selectedHexPattern(self) -> int:
+        return self._selected_hex_pattern
+
+    @Property(int, notify=stateChanged)
+    def selectedHexRow(self) -> int:
+        if not 0 <= self._selected_hex_pattern < len(self._hex_patterns):
+            return 0
+        offset = self._hex_patterns[self._selected_hex_pattern]["offset"]
+        return max(0, (offset - self._hex_base_offset) // 16)
+
+    @Property(bool, notify=stateChanged)
+    def hasSelectedHexByte(self) -> bool:
+        return self._selected_hex_byte() is not None
+
+    @Property(str, notify=stateChanged)
+    def selectedHexOffset(self) -> str:
+        return f"0x{self._selected_hex_offset:X}" if self._selected_hex_byte() is not None else ""
+
+    @Property(str, notify=stateChanged)
+    def selectedHexValue(self) -> str:
+        value = self._selected_hex_byte()
+        return f"{value:02X}" if value is not None else ""
+
+    @Property(str, notify=stateChanged)
+    def selectedHexAscii(self) -> str:
+        value = self._selected_hex_byte()
+        if value is None:
+            return ""
+        return chr(value) if 32 <= value <= 126 else "."
+
+    @Property(bool, notify=stateChanged)
+    def hasHexSelection(self) -> bool:
+        return self._hex_selection_bounds() is not None
+
+    @Property(int, notify=stateChanged)
+    def hexSelectionSize(self) -> int:
+        bounds = self._hex_selection_bounds()
+        return bounds[1] - bounds[0] + 1 if bounds is not None else 0
+
+    @Property(str, notify=stateChanged)
+    def selectedHexRange(self) -> str:
+        bounds = self._hex_selection_bounds()
+        if bounds is None:
+            return ""
+        return f"0x{bounds[0]:X} - 0x{bounds[1]:X} ({bounds[1] - bounds[0] + 1} bytes)"
+
+    @Property(bool, notify=stateChanged)
+    def hexHighlightsVisible(self) -> bool:
+        return self._hex_highlights_visible
 
     @Property(bool, notify=stateChanged)
     def hasMaterialChoice(self) -> bool:
@@ -1698,6 +1795,435 @@ class ParticleController(QObject):
             return None
         return self.texture_bindings_model.binding_at(self._selected_texture_index)
 
+    @Slot(int)
+    def selectHexScope(self, option_index: int) -> None:
+        if not 0 <= option_index < len(self.hexScopeOptions):
+            return
+        self._selected_hex_scope = option_index
+        self._refresh_hex_view()
+        self.stateChanged.emit()
+
+    @Slot(int)
+    def selectHexPattern(self, pattern_index: int) -> None:
+        self._selected_hex_pattern = pattern_index if 0 <= pattern_index < len(self._hex_patterns) else -1
+        self.hex_viewer_model.set_selected_pattern(self._selected_hex_pattern)
+        self.stateChanged.emit()
+
+    @Slot(int)
+    def selectHexByte(self, offset: int) -> None:
+        self.beginHexSelection(offset)
+
+    @Slot(int)
+    def beginHexSelection(self, offset: int) -> None:
+        if self._selected_hex_byte_at(offset) is None:
+            return
+        self._hex_selection_anchor = offset
+        self._hex_selection_end = offset
+        self._selected_hex_offset = offset
+        self._update_hex_selection()
+
+    @Slot(int)
+    def extendHexSelection(self, offset: int) -> None:
+        if self._hex_selection_anchor < 0 or self._selected_hex_byte_at(offset) is None:
+            return
+        self._hex_selection_end = offset
+        self._update_hex_selection()
+
+    @Slot(int, result=bool)
+    def isHexOffsetSelected(self, offset: int) -> bool:
+        bounds = self._hex_selection_bounds()
+        return bounds is not None and bounds[0] <= offset <= bounds[1]
+
+    @Slot()
+    def clearHexSelection(self) -> None:
+        if self._hex_selection_bounds() is None:
+            return
+        self._hex_selection_anchor = -1
+        self._hex_selection_end = -1
+        self._selected_hex_offset = -1
+        self._update_hex_selection()
+
+    @Slot(int, result=str)
+    def hexSafeRegionNoteAt(self, offset: int) -> str:
+        if not self._hex_highlights_visible:
+            return ""
+        for pattern in self._hex_safe_patterns:
+            if pattern["offset"] <= offset < pattern["offset"] + pattern["size"]:
+                return pattern.get("note", pattern["label"])
+        return ""
+
+    @Slot(int, int)
+    def extendHexSelectionCell(self, row: int, column: int) -> None:
+        if row < 0 or not 0 <= column < 16:
+            return
+        self.extendHexSelection(self._hex_base_offset + row * 16 + column)
+
+    @Slot(int, int, result=int)
+    def hexOffsetAtCell(self, row: int, column: int) -> int:
+        if row < 0 or not 0 <= column < 16:
+            return -1
+        offset = self._hex_base_offset + row * 16 + column
+        return offset if self._selected_hex_byte_at(offset) is not None else -1
+
+    @Slot(int, int)
+    def copyHexSelectionToCell(self, row: int, column: int) -> None:
+        if row < 0 or not 0 <= column < 16:
+            return
+        self.copyHexSelectionTo(self._hex_base_offset + row * 16 + column)
+
+    @Slot(int, result=bool)
+    def copyHexSelectionTo(self, destination_offset: int) -> bool:
+        document = self.current_document
+        bounds = self._hex_selection_bounds()
+        if document is None or bounds is None:
+            return False
+        try:
+            data = document.effect.to_bytes()
+        except ValueError:
+            return False
+        size = self.hexSelectionSize
+        if self._selected_hex_scope == 0:
+            scope_end = len(data)
+        else:
+            systems = document.effect.particle_systems
+            scope_end = systems[self._selected_hex_scope - 1].offset + systems[self._selected_hex_scope - 1].size
+        if not (
+            self._hex_base_offset <= destination_offset
+            and destination_offset + size <= scope_end
+        ):
+            self._set_status("Drop the selection fully inside the visible hex scope.")
+            return False
+        return self._apply_hex_replacement(
+            data[bounds[0]:bounds[1] + 1],
+            "Drag-copy hex selection",
+            offset=destination_offset,
+            select_range=(destination_offset, destination_offset + size - 1),
+        )
+
+    @Slot()
+    def copyHexSelection(self) -> None:
+        bounds = self._hex_selection_bounds()
+        document = self.current_document
+        if bounds is None or document is None:
+            return
+        try:
+            data = document.effect.to_bytes()[bounds[0]:bounds[1] + 1]
+        except ValueError:
+            return
+        QApplication.clipboard().setText(" ".join(f"{value:02X}" for value in data))
+        self._set_status(f"Copied {len(data)} hex byte(s).")
+
+    @Slot(result=bool)
+    def pasteHexClipboard(self) -> bool:
+        return self.pasteHexBytes(QApplication.clipboard().text())
+
+    @Slot()
+    def toggleHexHighlights(self) -> None:
+        self._hex_highlights_visible = not self._hex_highlights_visible
+        self.hex_viewer_model.set_safe_regions_visible(self._hex_highlights_visible)
+        self.stateChanged.emit()
+
+    @Slot()
+    def refreshHexViewer(self) -> None:
+        self._refresh_hex_view()
+        self.stateChanged.emit()
+
+    @Slot(str, result=bool)
+    def applySelectedHexByte(self, text: str) -> bool:
+        value = text.strip().removeprefix("0x").removeprefix("0X")
+        if not re.fullmatch(r"[0-9A-Fa-f]{2}", value):
+            self._set_status("Enter exactly one hexadecimal byte from 00 to FF.")
+            return False
+        return self._apply_hex_replacement(
+            bytes([int(value, 16)]) * max(1, self.hexSelectionSize),
+            "Edit hex byte" if self.hexSelectionSize <= 1 else "Fill hex selection",
+        )
+
+    @Slot(str, result=bool)
+    def pasteHexBytes(self, text: str) -> bool:
+        compact = re.sub(r"[^0-9A-Fa-f]", "", text)
+        if not compact or len(compact) % 2 or len(compact) > 8192:
+            self._set_status("Paste 1 to 4096 bytes as hexadecimal pairs, for example: 00 FF 1A.")
+            return False
+        replacement = bytes.fromhex(compact)
+        if self.hexSelectionSize > 1 and len(replacement) != self.hexSelectionSize:
+            self._set_status("Pasted byte count must match the selected hex range.")
+            return False
+        return self._apply_hex_replacement(replacement, "Paste hex bytes")
+
+    @Slot(result=bool)
+    def restoreSelectedHexByte(self) -> bool:
+        document = self.current_document
+        bounds = self._hex_selection_bounds()
+        if document is None or bounds is None or bounds[1] >= len(document.source_data):
+            return False
+        return self._apply_hex_replacement(
+            document.source_data[bounds[0]:bounds[1] + 1],
+            "Restore original hex byte" if self.hexSelectionSize <= 1 else "Restore original hex selection",
+        )
+
+    def _refresh_hex_view(self) -> None:
+        document = self.current_document
+        if document is None:
+            self._hex_patterns = []
+            self._hex_safe_patterns = []
+            self._hex_base_offset = 0
+            self._selected_hex_scope = 0
+            self._selected_hex_pattern = -1
+            self._selected_hex_offset = -1
+            self._hex_selection_anchor = -1
+            self._hex_selection_end = -1
+            self.hex_viewer_model.set_content(b"", 0, [], [])
+            return
+        try:
+            data = document.effect.to_bytes()
+        except ValueError:
+            data = document.effect.original_data
+        systems = document.effect.particle_systems
+        if not 0 <= self._selected_hex_scope <= len(systems):
+            self._selected_hex_scope = 0
+
+        if self._selected_hex_scope == 0:
+            base_offset = 0
+            view_data = data
+            patterns = self._particle_hex_patterns(document.effect, len(data))
+            safe_patterns = self._particle_hex_safe_patterns(document.effect, len(data))
+        else:
+            system = systems[self._selected_hex_scope - 1]
+            base_offset = system.offset
+            view_data = data[system.offset:system.offset + system.size]
+            patterns = self._system_hex_patterns(system, len(data), include_system=True)
+            safe_patterns = self._system_hex_safe_patterns(system, len(data))
+
+        self._hex_base_offset = base_offset
+        self._hex_patterns = patterns
+        self._hex_safe_patterns = safe_patterns
+        self._selected_hex_pattern = -1
+        self.hex_viewer_model.set_content(view_data, base_offset, patterns, safe_patterns)
+        if not base_offset <= self._selected_hex_offset < base_offset + len(view_data):
+            self._selected_hex_offset = -1
+        if self._hex_selection_bounds() is None or not (
+            base_offset <= self._hex_selection_anchor < base_offset + len(view_data)
+            and base_offset <= self._hex_selection_end < base_offset + len(view_data)
+        ):
+            self._hex_selection_anchor = -1
+            self._hex_selection_end = -1
+        self.hex_viewer_model.set_selected_offset(self._selected_hex_offset)
+        self.hex_viewer_model.set_selection_range(self._hex_selection_anchor, self._hex_selection_end)
+        self.hex_viewer_model.set_safe_regions_visible(self._hex_highlights_visible)
+
+    def _selected_hex_byte(self) -> int | None:
+        return self._selected_hex_byte_at(self._selected_hex_offset)
+
+    def _selected_hex_byte_at(self, offset: int) -> int | None:
+        document = self.current_document
+        if document is None or offset < 0:
+            return None
+        try:
+            data = document.effect.to_bytes()
+        except ValueError:
+            return None
+        return data[offset] if offset < len(data) else None
+
+    def _hex_selection_bounds(self) -> tuple[int, int] | None:
+        if self._hex_selection_anchor < 0 or self._hex_selection_end < 0:
+            return None
+        return tuple(sorted((self._hex_selection_anchor, self._hex_selection_end)))
+
+    def _update_hex_selection(self) -> None:
+        self.hex_viewer_model.set_selected_offset(self._selected_hex_offset)
+        self.hex_viewer_model.set_selection_range(self._hex_selection_anchor, self._hex_selection_end)
+        self.stateChanged.emit()
+
+    def _apply_hex_replacement(
+        self,
+        replacement: bytes,
+        label: str,
+        *,
+        offset: int | None = None,
+        select_range: tuple[int, int] | None = None,
+    ) -> bool:
+        document = self.current_document
+        bounds = self._hex_selection_bounds()
+        if document is None or bounds is None:
+            return False
+        if offset is None:
+            offset = bounds[0]
+        try:
+            current = document.effect.to_bytes()
+        except ValueError as error:
+            self._show_error("Unable to edit hex", str(error))
+            return False
+        if offset + len(replacement) > len(current):
+            self._set_status("The pasted bytes extend beyond this particle file.")
+            return False
+        updated = current[:offset] + replacement + current[offset + len(replacement):]
+        if updated == current:
+            return True
+        try:
+            candidate = ParticleEffect.from_bytes(updated)
+            candidate.to_bytes()
+        except (ParticleParseError, ValueError) as error:
+            self._show_error("Unsafe hex change rejected", str(error))
+            return False
+
+        def apply(data: bytes) -> None:
+            self._replace_document_effect_from_hex(document, data)
+
+        if select_range is not None:
+            self._hex_selection_anchor, self._hex_selection_end = select_range
+            self._selected_hex_offset = select_range[0]
+        document.undo_stack.push(ValueEditCommand(label, apply, current, updated))
+        return True
+
+    def _replace_document_effect_from_hex(self, document: Document, data: bytes) -> None:
+        document.effect = ParticleEffect.from_bytes(data)
+        document.selections = {"color": [], "opacity": [], "intensity": []}
+        document.selection_undo.clear()
+        document.selection_redo.clear()
+        if document is self.current_document:
+            effect = document.effect
+            self.color_model.set_effect(effect)
+            self.opacity_model.set_effect(effect)
+            self.intensity_model.set_effect(effect)
+            self._refresh_assets()
+            self.visualizer_model.set_effect(effect, self._mesh_archive_locations(document))
+            self._refresh_hex_view()
+            self.currentDocumentChanged.emit()
+            self.tableSelectionsChanged.emit("color")
+            self.tableSelectionsChanged.emit("opacity")
+            self.tableSelectionsChanged.emit("intensity")
+        self._document_state_changed(document)
+
+    def _particle_hex_patterns(self, effect: ParticleEffect, data_size: int) -> list[dict]:
+        patterns = []
+        first_system_offset = effect.particle_systems[0].offset if effect.particle_systems else data_size
+        self._add_hex_pattern(patterns, "Particle header & tables", 0, first_system_offset, "particle", data_size)
+        if effect.variables:
+            hash_start = min(variable.hash_offset for variable in effect.variables)
+            hash_end = max(variable.hash_offset + 4 for variable in effect.variables)
+            value_start = min(variable.value_offset for variable in effect.variables)
+            value_end = max(variable.value_offset + 12 for variable in effect.variables)
+            self._add_hex_pattern(patterns, "Particle variable hashes", hash_start, hash_end - hash_start, "system", data_size)
+            self._add_hex_pattern(patterns, "Particle variable defaults", value_start, value_end - value_start, "system", data_size)
+        for system in effect.particle_systems:
+            self._add_hex_pattern(patterns, f"Particle System {system.index + 1}", system.offset, system.size, "system", data_size)
+            patterns.extend(self._system_hex_patterns(system, data_size, include_system=False))
+        return patterns
+
+    def _system_hex_patterns(self, system, data_size: int, include_system: bool) -> list[dict]:
+        patterns = []
+        prefix = f"System {system.index + 1}: "
+        if include_system:
+            self._add_hex_pattern(patterns, prefix + "entire system", system.offset, system.size, "system", data_size)
+        self._add_hex_pattern(patterns, prefix + "header", system.offset, 260, "system", data_size)
+        if system.component_data is not None:
+            self._add_hex_pattern(
+                patterns, prefix + "component block", system.component_data.offset,
+                system.component_data.size, "component", data_size,
+            )
+        if system.emitter_data is not None:
+            self._add_hex_pattern(
+                patterns, prefix + "emitter block", system.emitter_data.offset,
+                system.emitter_data.size, "emitter", data_size,
+            )
+        for marker in system.emitter_markers:
+            self._add_hex_pattern(
+                patterns, prefix + f"emitter marker {marker.type_name}", marker.offset,
+                4, "marker", data_size,
+            )
+        if system.visualizer is not None and system.emitter_data is not None:
+            visualizer_offset = system.emitter_data.offset + system.emitter_data.size
+            visualizer_size = 252 if system.visualizer.visualizer_type in {2, 3} else 260
+            self._add_hex_pattern(
+                patterns, prefix + f"{system.visualizer.type_name} visualizer", visualizer_offset,
+                visualizer_size, "visualizer", data_size,
+            )
+        for label, graphs in (
+            ("intensity graph", system.scale_graphs),
+            ("opacity graph", system.opacity_graphs),
+            ("color graph", system.color_graphs),
+        ):
+            for index, graph in enumerate(graphs, start=1):
+                self._add_hex_pattern(
+                    patterns, prefix + f"{label} {index}", graph.x_offset,
+                    160, "graph", data_size,
+                )
+        return patterns
+
+    def _particle_hex_safe_patterns(self, effect: ParticleEffect, data_size: int) -> list[dict]:
+        patterns = []
+        self._add_hex_pattern(
+            patterns, "Lifetime: minimum", 4, 4, "particle", data_size,
+            "Minimum particle lifetime in seconds. It must not exceed the maximum lifetime.",
+        )
+        self._add_hex_pattern(
+            patterns, "Lifetime: maximum", 8, 4, "particle", data_size,
+            "Maximum particle lifetime in seconds. It must not be lower than the minimum lifetime.",
+        )
+        for system in effect.particle_systems:
+            patterns.extend(self._system_hex_safe_patterns(system, data_size))
+        return patterns
+
+    def _system_hex_safe_patterns(self, system, data_size: int) -> list[dict]:
+        patterns = []
+        prefix = f"System {system.index + 1}: "
+        self._add_hex_pattern(
+            patterns, prefix + "enabled / max particles", system.offset, 4, "system", data_size,
+            "Maximum particle count. PM uses zero here to disable this particle system when writing a patch.",
+        )
+        visualizer = system.visualizer
+        if visualizer is not None:
+            for label, offset in (
+                ("visualizer material ID", visualizer.material_offset),
+                ("visualizer unit ID", visualizer.unit_offset),
+                ("visualizer mesh ID", visualizer.mesh_offset),
+            ):
+                if offset is not None:
+                    self._add_hex_pattern(
+                        patterns, prefix + label, offset, 8, "visualizer", data_size,
+                        f"Unsigned 64-bit archive entry ID used by this system's {label.replace('visualizer ', '').replace(' ID', '')}.",
+                    )
+        for label, graphs in (
+            ("intensity graph", system.scale_graphs),
+            ("opacity graph", system.opacity_graphs),
+            ("color graph", system.color_graphs),
+        ):
+            for index, graph in enumerate(graphs, start=1):
+                graph_end = graph.colors_offset + 120 if isinstance(graph, ColorGraph) else graph.y_offset + 40
+                note = (
+                    "Ten graph time points followed by ten RGB values. These are the Color tab values."
+                    if isinstance(graph, ColorGraph)
+                    else f"Ten graph time points followed by ten {label.replace(' graph', '')} values. These are the {label.split()[0].capitalize()} tab values."
+                )
+                self._add_hex_pattern(
+                    patterns, prefix + f"{label} {index}", graph.x_offset,
+                    graph_end - graph.x_offset, "graph", data_size, note,
+                )
+        return patterns
+
+    def _add_hex_pattern(
+        self,
+        patterns: list[dict],
+        label: str,
+        offset: int,
+        size: int,
+        color_key: str,
+        data_size: int,
+        note: str = "",
+    ) -> None:
+        start = max(0, offset)
+        end = min(data_size, start + max(0, size))
+        if end <= start:
+            return
+        patterns.append({
+            "label": label,
+            "offset": start,
+            "size": end - start,
+            "color": self.HEX_PATTERN_COLORS[color_key],
+            "note": note,
+        })
+
     def _refresh_assets(self) -> None:
         document = self.current_document
         archive = self._resource_archive_for_document(document)
@@ -1924,6 +2450,7 @@ class ParticleController(QObject):
                 archive.clear_payload_cache()
         self._refresh_assets()
         self.visualizer_model.set_effect(effect, self._mesh_archive_locations(self.current_document))
+        self._refresh_hex_view()
         self.currentDocumentChanged.emit()
         self.stateChanged.emit()
 

@@ -20,6 +20,9 @@ ApplicationWindow {
     property var selectedParticleIndexes: []
     property int particleSelectionAnchor: -1
     property var collapsedParticleGroups: []
+    property bool hexDragSelecting: false
+    property bool hexCopyDragging: false
+    property string hexSafeHoverNote: ""
 
     function particleIsSelected(index) {
         return selectedParticleIndexes.indexOf(index) >= 0
@@ -93,6 +96,18 @@ ApplicationWindow {
     Shortcut { sequence: StandardKey.SaveAs; enabled: controller.documentCount > 0; onActivated: controller.saveProjectAs() }
     Shortcut { sequence: StandardKey.Undo; enabled: controller.canUndo; onActivated: controller.undo() }
     Shortcut { sequence: StandardKey.Redo; enabled: controller.canRedo; onActivated: controller.redo() }
+    Shortcut {
+        sequence: StandardKey.Copy
+        enabled: window.sectionIndex === 7 && controller.hasHexSelection
+                 && !hexByteInput.activeFocus && !hexPasteInput.activeFocus
+        onActivated: controller.copyHexSelection()
+    }
+    Shortcut {
+        sequence: StandardKey.Paste
+        enabled: window.sectionIndex === 7 && controller.hasHexSelection
+                 && !hexByteInput.activeFocus && !hexPasteInput.activeFocus
+        onActivated: controller.pasteHexClipboard()
+    }
 
     header: Rectangle {
         height: 54
@@ -144,7 +159,7 @@ ApplicationWindow {
                 ToolTip.text: "File"
                 ToolTip.delay: 500
             }
-            PmButton { text: "Load Archive"; tooltip: "Load an archive by ID or found archive name"; onClicked: window.sectionIndex = 7 }
+            PmButton { text: "Load Archive"; tooltip: "Load an archive by ID or found archive name"; onClicked: window.sectionIndex = 8 }
             PmButton { text: "Create Patch"; tooltip: "Create a patch target"; onClicked: controller.createPatch() }
             Rectangle {
                 id: patchSelector
@@ -599,7 +614,7 @@ ApplicationWindow {
                         font.weight: Font.DemiBold
                     }
                     Repeater {
-                        model: ["Color", "Opacity", "Intensity", "Lifetime", "Visualizers", "Texture", "Material Editor"]
+                        model: ["Color", "Opacity", "Intensity", "Lifetime", "Visualizers", "Texture", "Material Editor", "Hex Viewer"]
                         delegate: Rectangle {
                             id: navItem
                             required property int index
@@ -791,8 +806,8 @@ ApplicationWindow {
                         objectName: "editorStack"
                         Layout.fillWidth: true
                         Layout.fillHeight: true
-                        currentIndex: controller.hasDocument || window.sectionIndex === 7
-                                      ? window.sectionIndex : 8
+                        currentIndex: controller.hasDocument || window.sectionIndex === 8
+                                      ? window.sectionIndex : 9
 
                         GraphTable {
                             objectName: "colorGraphTable"
@@ -1471,6 +1486,250 @@ ApplicationWindow {
                         }
 
                         Item {
+                            ColumnLayout {
+                                anchors.fill: parent
+                                anchors.margins: 16
+                                spacing: 10
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    Text { text: "HEX VIEWER"; color: Theme.text; font.pixelSize: 15; font.weight: Font.DemiBold; Layout.fillWidth: true }
+                                    Text { text: "RAW EDIT"; color: Theme.textMuted; font.pixelSize: 10; font.weight: Font.DemiBold }
+                                    PmButton {
+                                        text: controller.hexHighlightsVisible ? "Hide Safe Regions" : "Show Safe Regions"
+                                        tooltip: "Show or hide byte ranges edited through PM's safe editor tabs"
+                                        onClicked: controller.toggleHexHighlights()
+                                    }
+                                    PmButton { text: "Refresh"; tooltip: "Refresh bytes after edits"; onClicked: controller.refreshHexViewer() }
+                                }
+                                ComboBox {
+                                    id: hexScopeSelector
+                                    Layout.fillWidth: true
+                                    Layout.preferredHeight: 36
+                                    model: controller.hexScopeOptions
+                                    enabled: model.length > 0
+                                    currentIndex: controller.selectedHexScope
+                                    onActivated: controller.selectHexScope(currentIndex)
+                                }
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    enabled: controller.hasSelectedHexByte
+                                    spacing: 5
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 7
+                                        Text { text: controller.selectedHexRange; color: Theme.textMuted; font.pixelSize: 11; font.family: "Consolas"; Layout.fillWidth: true; elide: Text.ElideRight }
+                                        PmTextField {
+                                            id: hexByteInput
+                                            Layout.preferredWidth: 64
+                                            text: controller.selectedHexValue
+                                            placeholderText: "00"
+                                            inputMethodHints: Qt.ImhNoPredictiveText
+                                            validator: RegularExpressionValidator { regularExpression: /[0-9A-Fa-f]{0,2}/ }
+                                            onEditingFinished: controller.applySelectedHexByte(text)
+                                        }
+                                        PmButton { text: "Apply"; onClicked: controller.applySelectedHexByte(hexByteInput.text) }
+                                        PmButton { text: "Restore"; tooltip: "Restore the selected byte range from the originally opened particle"; onClicked: controller.restoreSelectedHexByte() }
+                                    }
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 7
+                                        PmButton { text: "Copy"; tooltip: "Copy the selected byte range as hexadecimal values"; onClicked: controller.copyHexSelection() }
+                                        PmButton { text: "Paste Clipboard"; tooltip: "Paste hexadecimal values from the clipboard into the selected range"; onClicked: controller.pasteHexClipboard() }
+                                        PmTextField {
+                                            id: hexPasteInput
+                                            Layout.fillWidth: true
+                                            placeholderText: "Paste hex bytes: 00 FF 1A"
+                                            inputMethodHints: Qt.ImhNoPredictiveText
+                                            onAccepted: { if (controller.pasteHexBytes(text)) clear() }
+                                        }
+                                        PmButton { text: "Paste"; onClicked: { if (controller.pasteHexBytes(hexPasteInput.text)) hexPasteInput.clear() } }
+                                    }
+                                }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    Layout.fillHeight: true
+                                    spacing: 10
+                                    Rectangle {
+                                        Layout.preferredWidth: 220
+                                        Layout.minimumWidth: 150
+                                        Layout.fillHeight: true
+                                        color: Theme.surface
+                                        border.width: 1
+                                        border.color: Theme.border
+                                        radius: 4
+                                        ColumnLayout {
+                                            anchors.fill: parent
+                                            anchors.margins: 8
+                                            spacing: 6
+                                            Text { text: "PARSED PATTERNS"; color: Theme.textMuted; font.pixelSize: 10; font.weight: Font.DemiBold }
+                                            ListView {
+                                                id: hexPatternList
+                                                Layout.fillWidth: true
+                                                Layout.fillHeight: true
+                                                model: controller.hexPatternOptions
+                                                clip: true
+                                                spacing: 2
+                                                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                                                delegate: Rectangle {
+                                                    id: hexPatternDelegate
+                                                    required property int index
+                                                    required property var modelData
+                                                    width: hexPatternList.width - 8
+                                                    height: 44
+                                                    radius: 3
+                                                    color: controller.selectedHexPattern === index ? Theme.surfaceRaised : hexPatternMouse.containsMouse ? Theme.surfaceHover : "transparent"
+                                                    border.width: controller.selectedHexPattern === index ? 1 : 0
+                                                    border.color: modelData.color
+                                                    Rectangle { width: 3; height: parent.height - 10; anchors.left: parent.left; anchors.leftMargin: 5; anchors.verticalCenter: parent.verticalCenter; radius: 1; color: modelData.color }
+                                                    Text { anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.leftMargin: 14; anchors.rightMargin: 5; anchors.topMargin: 5; text: modelData.label; color: Theme.text; font.pixelSize: 10; elide: Text.ElideRight }
+                                                    Text { anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; anchors.leftMargin: 14; anchors.rightMargin: 5; anchors.bottomMargin: 5; text: modelData.offset + "  |  " + modelData.size; color: Theme.textMuted; font.pixelSize: 9 }
+                                                    MouseArea {
+                                                        id: hexPatternMouse
+                                                        anchors.fill: parent
+                                                        hoverEnabled: true
+                                                        cursorShape: Qt.PointingHandCursor
+                                                        onClicked: {
+                                                            controller.selectHexPattern(hexPatternDelegate.index)
+                                                            hexRows.positionViewAtIndex(controller.selectedHexRow, ListView.Center)
+                                                        }
+                                                    }
+                                                }
+                                                Text { anchors.centerIn: parent; visible: hexPatternList.count === 0; text: "Open a particle to inspect bytes"; color: Theme.textMuted; font.pixelSize: 11; horizontalAlignment: Text.AlignHCenter; width: parent.width - 20; wrapMode: Text.WordWrap }
+                                            }
+                                        }
+                                    }
+                                    Rectangle {
+                                        id: hexDataPanel
+                                        Layout.fillWidth: true
+                                        Layout.fillHeight: true
+                                        property int byteWidth: Math.max(12, Math.min(29, Math.floor((width - 76) / 16) - 1))
+                                        property bool showAscii: width >= 680
+                                        color: "#11151B"
+                                        border.width: 1
+                                        border.color: Theme.border
+                                        radius: 4
+                                        ColumnLayout {
+                                            anchors.fill: parent
+                                            anchors.margins: 8
+                                            spacing: 4
+                                            Row {
+                                                Layout.fillWidth: true
+                                                spacing: 1
+                                                Text { width: 74; text: "OFFSET"; color: Theme.textMuted; font.pixelSize: 10; font.family: "Consolas" }
+                                                Repeater {
+                                                    model: 16
+                                                    delegate: Text { required property int index; width: hexDataPanel.byteWidth; text: index.toString(16).toUpperCase().padStart(2, "0"); color: Theme.textMuted; font.pixelSize: 10; font.family: "Consolas"; horizontalAlignment: Text.AlignHCenter }
+                                                }
+                                                Text { visible: hexDataPanel.showAscii; width: 116; text: "ASCII"; color: Theme.textMuted; font.pixelSize: 10; font.family: "Consolas"; horizontalAlignment: Text.AlignHCenter }
+                                            }
+                                            Rectangle { Layout.fillWidth: true; Layout.preferredHeight: 1; color: Theme.border }
+                                            ListView {
+                                                id: hexRows
+                                                Layout.fillWidth: true
+                                                Layout.fillHeight: true
+                                                model: hexViewerModel
+                                                clip: true
+                                                boundsBehavior: Flickable.StopAtBounds
+                                                ScrollBar.vertical: ScrollBar { id: hexScrollBar; policy: ScrollBar.AsNeeded }
+                                                delegate: Row {
+                                                    required property string hexOffset
+                                                    required property var hexCells
+                                                    required property string asciiText
+                                                    width: hexRows.width - 8
+                                                    height: 23
+                                                    spacing: 1
+                                                    Text { width: 74; height: 22; text: hexOffset; color: Theme.textMuted; font.pixelSize: 11; font.family: "Consolas"; verticalAlignment: Text.AlignVCenter }
+                                                    Repeater {
+                                                        model: hexCells
+                                                        delegate: Rectangle {
+                                                            required property var modelData
+                                                            width: hexDataPanel.byteWidth; height: 22; radius: 2
+                                                            color: modelData.active ? "#4A3A20" : modelData.rangeSelected ? "#1D3B3E" : modelData.safe ? "#332E1A" : modelData.selected ? "#263849" : "transparent"
+                                                            border.width: modelData.active || modelData.rangeSelected || modelData.safe || modelData.selected ? 1 : 0
+                                                            border.color: modelData.active ? "#F2C26B" : modelData.rangeSelected ? "#66C3AD" : modelData.safe ? "#E3BF69" : modelData.color
+                                                            Text { anchors.centerIn: parent; text: modelData.text; color: modelData.color; font.pixelSize: 11; font.family: "Consolas" }
+                                                        }
+                                                    }
+                                                    Text { visible: hexDataPanel.showAscii; width: 116; height: 22; text: asciiText; color: Theme.textMuted; font.pixelSize: 11; font.family: "Consolas"; verticalAlignment: Text.AlignVCenter; elide: Text.ElideRight }
+                                                }
+                                                Text { anchors.centerIn: parent; visible: hexRows.count === 0; text: "No particle bytes to display"; color: Theme.textMuted; font.pixelSize: 12 }
+                                                MouseArea {
+                                                    id: hexPointer
+                                                    anchors.fill: parent
+                                                    anchors.rightMargin: Math.max(12, hexScrollBar.width + 2)
+                                                    z: 10
+                                                    hoverEnabled: true
+                                                    preventStealing: true
+                                                    cursorShape: window.hexDragSelecting || window.hexCopyDragging
+                                                                 ? Qt.CrossCursor : Qt.ArrowCursor
+
+                                                    function offsetAt(pointX, pointY) {
+                                                        const point = mapToItem(hexRows.contentItem, pointX, pointY)
+                                                        const row = Math.floor(point.y / 23)
+                                                        const column = Math.floor((point.x - 75) / (hexDataPanel.byteWidth + 1))
+                                                        if (row < 0 || column < 0 || column >= 16)
+                                                            return -1
+                                                        return controller.hexOffsetAtCell(row, column)
+                                                    }
+
+                                                    function updateSafeHoverNote() {
+                                                        window.hexSafeHoverNote = controller.hexSafeRegionNoteAt(offsetAt(mouseX, mouseY))
+                                                    }
+
+                                                    onPressed: function(mouse) {
+                                                        const offset = offsetAt(mouse.x, mouse.y)
+                                                        if (offset < 0) {
+                                                            controller.clearHexSelection()
+                                                            return
+                                                        }
+                                                        if (controller.isHexOffsetSelected(offset)) {
+                                                            window.hexCopyDragging = true
+                                                            window.hexDragSelecting = false
+                                                            return
+                                                        }
+                                                        window.hexCopyDragging = false
+                                                        window.hexDragSelecting = true
+                                                        controller.beginHexSelection(offset)
+                                                    }
+                                                    onPositionChanged: function(mouse) {
+                                                        updateSafeHoverNote()
+                                                        if (!window.hexDragSelecting)
+                                                            return
+                                                        const offset = offsetAt(mouse.x, mouse.y)
+                                                        if (offset >= 0)
+                                                            controller.extendHexSelection(offset)
+                                                    }
+                                                    onReleased: function(mouse) {
+                                                        const offset = offsetAt(mouse.x, mouse.y)
+                                                        if (window.hexCopyDragging && offset >= 0)
+                                                            controller.copyHexSelectionTo(offset)
+                                                        window.hexDragSelecting = false
+                                                        window.hexCopyDragging = false
+                                                    }
+                                                    onEntered: updateSafeHoverNote()
+                                                    onExited: window.hexSafeHoverNote = ""
+                                                    onPressedChanged: {
+                                                        if (!pressed)
+                                                            window.hexDragSelecting = false
+                                                    }
+                                                    onCanceled: {
+                                                        window.hexDragSelecting = false
+                                                        window.hexCopyDragging = false
+                                                    }
+                                                    ToolTip.visible: containsMouse && controller.hexHighlightsVisible
+                                                                     && window.hexSafeHoverNote !== ""
+                                                                     && !pressed
+                                                    ToolTip.text: window.hexSafeHoverNote
+                                                    ToolTip.delay: 550
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Item {
                             id: assetPanel
                             property int selectedAssetIndex: -1
                             property bool selectedTexture: false
@@ -1637,7 +1896,7 @@ ApplicationWindow {
                                     spacing: 8
                                     PmButton {
                                         text: "Open Archive"
-                                        onClicked: window.sectionIndex = 7
+                                        onClicked: window.sectionIndex = 8
                                     }
                                     PmButton {
                                         text: "Open .particle"

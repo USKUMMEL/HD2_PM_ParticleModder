@@ -80,6 +80,69 @@ class ControllerTests(unittest.TestCase):
         self.controller.redo()
         self.assertEqual(graph.y[1], 0.5)
 
+    def test_hex_viewer_marks_parsed_particle_ranges(self):
+        patterns = self.controller.hexPatternOptions
+        labels = [item["label"] for item in patterns]
+
+        self.assertGreater(self.controller.hex_viewer_model.rowCount(), 0)
+        self.assertIn("Particle header & tables", labels)
+        self.assertIn("System 1: header", labels)
+        self.assertIn("System 1: color graph 1", labels)
+
+        self.controller.selectHexScope(1)
+        self.assertEqual(self.controller.hexScopeOptions[1], "Particle System 1")
+        system_size = self.document.effect.particle_systems[0].size
+        self.assertEqual(self.controller.hex_viewer_model.rowCount(), (system_size + 15) // 16)
+        self.controller.selectHexPattern(1)
+        self.assertEqual(self.controller.selectedHexRow, 0)
+
+        self.controller.selectHexScope(0)
+        self.controller.selectHexByte(6)
+        self.assertEqual(self.controller.selectedHexValue, "80")
+        self.assertTrue(self.controller.applySelectedHexByte("00"))
+        self.assertEqual(struct.unpack_from("<f", self.document.effect.to_bytes(), 4)[0], 0.5)
+        self.controller.undo()
+        self.assertEqual(struct.unpack_from("<f", self.document.effect.to_bytes(), 4)[0], 1.0)
+
+        self.controller.beginHexSelection(4)
+        self.controller.extendHexSelection(7)
+        self.assertEqual(self.controller.hexSelectionSize, 4)
+        self.assertEqual(self.controller.selectedHexRange, "0x4 - 0x7 (4 bytes)")
+        self.controller.clearHexSelection()
+        self.assertFalse(self.controller.hasHexSelection)
+        self.controller.beginHexSelection(4)
+        self.controller.extendHexSelection(7)
+        self.controller.copyHexSelection()
+        self.assertEqual(QApplication.clipboard().text(), "00 00 80 3F")
+        self.assertTrue(self.controller.pasteHexBytes("00 00 00 00"))
+        self.assertEqual(struct.unpack_from("<f", self.document.effect.to_bytes(), 4)[0], 0.0)
+        self.controller.undo()
+        self.assertEqual(struct.unpack_from("<f", self.document.effect.to_bytes(), 4)[0], 1.0)
+
+        self.assertTrue(self.controller.applySelectedHexByte("00"))
+        self.assertTrue(self.controller.copyHexSelectionTo(8))
+        self.assertEqual(struct.unpack_from("<f", self.document.effect.to_bytes(), 8)[0], 0.0)
+        self.controller.undo()
+        self.controller.undo()
+        self.assertEqual(struct.unpack_from("<ff", self.document.effect.to_bytes(), 4), (1.0, 3.0))
+
+        self.assertFalse(self.controller.hexHighlightsVisible)
+        cells = self.controller.hex_viewer_model.data(
+            self.controller.hex_viewer_model.index(0, 0),
+            self.controller.hex_viewer_model.CellsRole,
+        )
+        self.assertFalse(cells[4]["safe"])
+        self.controller.toggleHexHighlights()
+        self.assertTrue(self.controller.hexHighlightsVisible)
+        self.assertIn("Minimum particle lifetime", self.controller.hexSafeRegionNoteAt(4))
+        cells = self.controller.hex_viewer_model.data(
+            self.controller.hex_viewer_model.index(0, 0),
+            self.controller.hex_viewer_model.CellsRole,
+        )
+        self.assertTrue(cells[4]["safe"])
+        self.controller.toggleHexHighlights()
+        self.assertFalse(self.controller.hexHighlightsVisible)
+
     def test_fill_selection_is_one_undo_step(self):
         graph = self.controller.opacity_model.graph_at(0)
         original = [graph.y[0], graph.y[1], graph.y[2]]
